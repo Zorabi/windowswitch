@@ -78,6 +78,7 @@ enum AXRead {
 
 final class WindowCatalog {
     private let queue = DispatchQueue(label: "dongx.windowswitch.windows", qos: .userInitiated)
+    private let focusQueue = DispatchQueue(label: "dongx.windowswitch.focus", qos: .userInteractive)
     private var recency = WindowRecency()
     private var cached: [String: WindowItem] = [:]
     private var observers: [pid_t: AXObserver] = [:]
@@ -116,8 +117,8 @@ final class WindowCatalog {
     func noteFocusedWindow() {
         guard let app = NSWorkspace.shared.frontmostApplication,
               app.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
+        let now = Date()
         queue.async { [self] in
-            let now = Date()
             recency.recordApplication(pid: app.processIdentifier, at: now)
             let source = AXUIElementCreateApplication(app.processIdentifier)
             AXUIElementSetMessagingTimeout(source, 0.15)
@@ -246,7 +247,7 @@ final class WindowCatalog {
             }
             return
         }
-        queue.async { [self] in
+        focusQueue.async { [self] in
             guard !item.application.isTerminated else {
                 DispatchQueue.main.async { completion("目标应用已经退出，请重新选择窗口。") }
                 return
@@ -277,11 +278,14 @@ final class WindowCatalog {
             let focused = AXUIElementSetAttributeValue(source, kAXFocusedWindowAttribute as CFString, window)
             let activation = WSActivateFrontWindowOnly(item.pid)
             let raised = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-            queue.asyncAfter(deadline: .now() + 0.18) { [self] in
+            focusQueue.asyncAfter(deadline: .now() + 0.18) { [self] in
                 let actual = AXRead.element(source, kAXFocusedWindowAttribute)
                 let confirmed = (actual.map { CFEqual($0, window) } ?? false) || AXRead.bool(window, kAXFocusedAttribute) == true
                 let success = activation == noErr && confirmed
-                if success { recency.recordWindow(key: item.key, pid: item.pid, isPrimary: item.isWeChatMain, at: Date()) }
+                if success {
+                    let usedAt = Date()
+                    queue.async { [self] in recency.recordWindow(key: item.key, pid: item.pid, isPrimary: item.isWeChatMain, at: usedAt) }
+                }
                 if !success {
                     NSLog("Window focus unconfirmed: pid=%d activate=%d raise=%d main=%d focus=%d", item.pid, activation, raised.rawValue, main.rawValue, focused.rawValue)
                 }

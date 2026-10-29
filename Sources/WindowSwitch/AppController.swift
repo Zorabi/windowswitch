@@ -14,6 +14,7 @@ final class AppController: NSObject {
     private var timer: Timer?
     private var activationObserver: NSObjectProtocol?
     private var session: UUID?
+    private var sessionSourcePID: pid_t?
     private var loading = false
     private var searchPinned = false
     private var pendingCommit = false
@@ -22,6 +23,10 @@ final class AppController: NSObject {
     private var trusted = false
     private var sampledInitialFocus = false
     private var lastSwitchError: String?
+    private var cachedItems: [WindowItem] = []
+    private var scanInFlight = false
+    private var lastScan = Date.distantPast
+    private var scanWaiters: [([WindowItem]) -> Void] = []
 
     func start() {
         PreferencesWindow.applyAppearance()
@@ -47,6 +52,10 @@ final class AppController: NSObject {
         ) { [weak self] _ in
             guard let self, self.trusted else { return }
             self.catalog.noteFocusedWindow()
+            if self.session == nil {
+                self.cachedItems = self.immediateWindowItems()
+                self.refreshWindowSnapshot(force: true)
+            }
             if !self.switcher.panel.isVisible { self.preferences?.restoreAfterSwitcher() }
         }
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.checkPermission() }
@@ -78,6 +87,7 @@ final class AppController: NSObject {
             keyboard.stop()
             if !trusted { cancel() }
         }
+        if trusted, session == nil, recorder == nil { refreshWindowSnapshot() }
         preferences?.update(trusted: trusted, enabled: !paused, ready: ready, shortcut: keyboard.shortcut.label, searchShortcut: keyboard.searchShortcut.label, commitOnRelease: keyboard.commitOnRelease)
     }
 
@@ -92,15 +102,23 @@ final class AppController: NSObject {
             }
             catalog.noteFocusedWindow()
             let id = UUID()
+            sessionSourcePID = NSWorkspace.shared.frontmostApplication?.processIdentifier
             session = id
             keyboard.panelPresented = true
-            loading = true
             searchPinned = false
             pendingCommit = false
             pendingSteps = reverse ? -1 : 1
-            switcher.show([], index: 0, searching: false, shortcut: keyboard.shortcut.label, commitOnRelease: keyboard.commitOnRelease, loading: true)
-            catalog.load(additionalItems: localSettingsItems()) { [weak self] items in
+            let immediate = immediateWindowItems()
+            loading = cachedItems.isEmpty
+            let index = immediate.isEmpty ? 0 : ((pendingSteps % immediate.count) + immediate.count) % immediate.count
+            switcher.show(immediate, index: index, searching: false, shortcut: keyboard.shortcut.label,
+                          commitOnRelease: keyboard.commitOnRelease, loading: loading)
+            refreshWindowSnapshot(force: true) { [weak self] items in
                 guard let self, self.session == id else { return }
+                if !self.loading {
+                    self.switcher.updateItems(self.immediateWindowItems())
+                    return
+                }
                 self.loading = false
                 guard !items.isEmpty else {
                     self.cancel()
@@ -127,6 +145,8 @@ final class AppController: NSObject {
 
     private func cancel(restoreFocus: Bool = true) {
         session = nil
+        sessionSourcePID = nil
+        scanWaiters.removeAll()
         keyboard.panelPresented = false
         loading = false
         pendingCommit = false
@@ -184,18 +204,81 @@ final class AppController: NSObject {
         cancel()
         keyboard.pinSearch()
         let id = UUID()
+        sessionSourcePID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         session = id
         keyboard.panelPresented = true
-        loading = true
         pendingCommit = false
         searchPinned = true
         catalog.noteFocusedWindow()
-        switcher.show([], index: 0, searching: true, shortcut: keyboard.shortcut.label, commitOnRelease: keyboard.commitOnRelease, loading: true)
-        catalog.load(additionalItems: localSettingsItems()) { [weak self] items in
+        let immediate = immediateWindowItems()
+        loading = cachedItems.isEmpty
+        switcher.show(immediate, index: 0, searching: true, shortcut: keyboard.shortcut.label,
+                      commitOnRelease: keyboard.commitOnRelease, loading: loading)
+        refreshWindowSnapshot(force: true) { [weak self] items in
             guard let self, self.session == id else { return }
-            self.loading = false
-            self.switcher.show(items, index: 0, searching: true, shortcut: self.keyboard.shortcut.label, commitOnRelease: self.keyboard.commitOnRelease)
+            if self.loading {
+                self.loading = false
+                self.switcher.show(items, index: 0, searching: true, shortcut: self.keyboard.shortcut.label, commitOnRelease: self.keyboard.commitOnRelease)
+            } else { self.switcher.updateItems(self.immediateWindowItems()) }
         }
+    }
+
+    /// Main-thread cache delivery. Only one expensive AX scan may be outstanding.
+    private func refreshWindowSnapshot(force: Bool = false, completion: (([WindowItem]) -> Void)? = nil) {
+        guard trusted else { return }
+        if let completion { scanWaiters.append(completion) }
+        guard !scanInFlight else { return }
+        guard force || Date().timeIntervalSince(lastScan) >= 3 else { return }
+        scanInFlight = true
+        catalog.load(additionalItems: localSettingsItems()) { [weak self] items in
+            guard let self else { return }
+            self.cachedItems = items
+            self.lastScan = Date()
+            self.scanInFlight = false
+            let waiters = self.scanWaiters
+            self.scanWaiters.removeAll()
+            let current = self.immediateWindowItems()
+            self.cachedItems = current
+            waiters.forEach { $0(current) }
+        }
+    }
+
+    /// Reconcile cached IDs with lightweight system metadata, without AX messages.
+    /// This also replaces a newly closed WeChat main window at its original position.
+    private func immediateWindowItems() -> [WindowItem] {
+        guard !cachedItems.isEmpty else { return [] }
+        let rows = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        let ids = Set(rows.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value })
+        let settings = localSettingsItems().first
+        let live = cachedItems.filter {
+            !$0.application.isTerminated && !$0.isLocalSettings && ($0.windowID.map(ids.contains) ?? true)
+        }
+        var items: [WindowItem] = []
+        var seen = Set<String>()
+        for old in cachedItems where !old.application.isTerminated {
+            let item: WindowItem?
+            if old.isLocalSettings { item = settings }
+            else if let current = live.first(where: { $0.key == old.key }) { item = current }
+            else if old.isWeChatMain, !live.contains(where: { $0.pid == old.pid && $0.isWeChatMain }) {
+                item = WindowItem(key: "app:\(old.pid)", pid: old.pid, windowID: nil, application: old.application,
+                    element: nil, appName: old.appName, title: old.appName, minimized: false, size: .zero)
+            } else { item = nil }
+            if let item, seen.insert(item.key).inserted { items.append(item) }
+        }
+        if let settings, seen.insert(settings.key).inserted { items.append(settings) }
+        let foregroundPID = switcher.panel.isVisible ? sessionSourcePID : NSWorkspace.shared.frontmostApplication?.processIdentifier
+        if let foregroundPID {
+            let firstKnown = rows.first { row in
+                (row[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == foregroundPID &&
+                (row[kCGWindowIsOnscreen as String] as? Bool) == true &&
+                items.contains { $0.windowID == (row[kCGWindowNumber as String] as? NSNumber)?.uint32Value }
+            }
+            let frontID = (firstKnown?[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+            if let index = items.firstIndex(where: { $0.pid == foregroundPID && (frontID == nil || $0.windowID == frontID) }) {
+                items.insert(items.remove(at: index), at: 0)
+            }
+        }
+        return items
     }
 
     @objc private func togglePause() {

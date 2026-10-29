@@ -286,6 +286,13 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         }
     }
 
+    func updateItems(_ items: [WindowItem]) {
+        guard panel.isVisible else { return }
+        let selectedKey = selected?.key
+        all = items
+        applyFilter(index: max(0, table.selectedRow), preserving: selectedKey)
+    }
+
     func focusSearch(selectAll: Bool = false) {
         onSearch?()
         setSearchFooter()
@@ -356,7 +363,7 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     }
     func windowDidResignKey(_ notification: Notification) { if !closing { onCancel?() } }
 
-    private func applyFilter(index: Int) {
+    private func applyFilter(index: Int, preserving key: String? = nil) {
         let query = search.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         filtered = all.filter { query.isEmpty || "\($0.appName) \($0.title)".localizedStandardContains(query) }
         table.reloadData()
@@ -369,7 +376,7 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         empty.stringValue = query.isEmpty ? "暂无可切换的窗口" : "没有匹配的窗口"
         emptyDetail.stringValue = query.isEmpty ? "打开一个应用窗口，然后再试一次。" : "试试其他窗口名称或应用名称。"
         if !filtered.isEmpty {
-            let row = min(max(index, 0), filtered.count - 1)
+            let row = key.flatMap { selectedKey in filtered.firstIndex { $0.key == selectedKey } } ?? min(max(index, 0), filtered.count - 1)
             table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             table.scrollRowToVisible(row)
         }
