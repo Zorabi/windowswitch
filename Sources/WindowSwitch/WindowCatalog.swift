@@ -83,6 +83,12 @@ final class WindowCatalog {
     private var cached: [String: WindowItem] = [:]
     private var observers: [pid_t: AXObserver] = [:]
 
+    private func windowTitle(_ title: String, application: NSRunningApplication, size: CGSize) -> String {
+        guard title.isEmpty else { return title }
+        let name = application.bundleIdentifier == "com.tencent.xinWeChat" ? "微信 · 其他窗口" : "未命名窗口"
+        return "\(name) · \(Int(size.width)) × \(Int(size.height))"
+    }
+
     private func remember(_ window: AXUIElement, application: NSRunningApplication) {
         let size = AXRead.size(window) ?? .zero
         guard size.width >= 70, size.height >= 70 else { return }
@@ -90,7 +96,7 @@ final class WindowCatalog {
         let title = (AXRead.value(window, kAXTitleAttribute) as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         cached[key] = WindowItem(key: key, pid: application.processIdentifier, windowID: AXRead.windowID(window),
             application: application, element: window, appName: application.localizedName ?? "应用",
-            title: title.isEmpty ? "未命名窗口 · \(Int(size.width)) × \(Int(size.height))" : title,
+            title: windowTitle(title, application: application, size: size),
             minimized: AXRead.bool(window, kAXMinimizedAttribute) == true, size: size)
     }
 
@@ -98,10 +104,10 @@ final class WindowCatalog {
         let pid = application.processIdentifier
         guard observers[pid] == nil else { return }
         var observer: AXObserver?
-        let callback: AXObserverCallback = { _, _, _, context in
+        let callback: AXObserverCallback = { _, element, notification, context in
             guard let context else { return }
             let catalog = Unmanaged<WindowCatalog>.fromOpaque(context).takeUnretainedValue()
-            catalog.noteFocusedWindow()
+            catalog.noteWindowEvent(element, notification: notification as String)
         }
         guard AXObserverCreate(pid, callback, &observer) == .success, let observer else { return }
         let source = AXUIElementCreateApplication(pid)
@@ -112,6 +118,29 @@ final class WindowCatalog {
         }
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
         observers[pid] = observer
+    }
+
+    private func noteWindowEvent(_ element: AXUIElement, notification: String) {
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success,
+              let app = NSRunningApplication(processIdentifier: pid) else { return }
+        let now = Date()
+        // Capture the element delivered by AX. Reading the frontmost application
+        // later can lose a window when several windows are created in succession.
+        queue.async { [self] in
+            AXUIElementSetMessagingTimeout(element, 0.15)
+            let role = AXRead.value(element, kAXRoleAttribute) as? String
+            let isWindow = role == kAXWindowRole || role == kAXSheetRole
+            let window = isWindow ? element : AXRead.element(element, kAXFocusedWindowAttribute)
+            guard let window else { return }
+            remember(window, application: app)
+            if notification == kAXFocusedWindowChangedNotification,
+               NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier {
+                let key = AXRead.key(pid: app.processIdentifier, element: window)
+                recency.recordWindow(key: key, pid: app.processIdentifier,
+                    isPrimary: cached[key]?.isWeChatMain == true, at: now)
+            }
+        }
     }
 
     func noteFocusedWindow() {
@@ -142,6 +171,8 @@ final class WindowCatalog {
         }
         queue.async { [self] in
             let cgWindows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+            let allCGWindows = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+            let liveWindowIDs = Set(allCGWindows.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value })
             var order: [CGWindowID: Int] = [:]
             for (index, row) in cgWindows.enumerated() {
                 if let id = row[kCGWindowNumber as String] as? NSNumber { order[id.uint32Value] = index }
@@ -155,42 +186,82 @@ final class WindowCatalog {
                 AXUIElementSetMessagingTimeout(source, hosts.contains(app.bundleIdentifier ?? "") ? 1.0 : 0.25)
                 var raw: CFTypeRef?
                 let readResult = AXUIElementCopyAttributeValue(source, kAXWindowsAttribute as CFString, &raw)
-                let windows = raw as? [AXUIElement] ?? []
+                let reportedWindows = raw as? [AXUIElement] ?? []
+                var windows = reportedWindows
+                if hosts.contains(app.bundleIdentifier ?? "") {
+                    // WeChat can expose only its current window through AXWindows.
+                    // Other top-level references still identify separate windows.
+                    for attribute in [kAXFocusedWindowAttribute, kAXMainWindowAttribute] {
+                        if let window = AXRead.element(source, attribute) { windows.append(window) }
+                    }
+                    let children = AXRead.value(source, kAXChildrenAttribute) as? [AXUIElement] ?? []
+                    for child in children {
+                        AXUIElementSetMessagingTimeout(child, 0.15)
+                        let role = AXRead.value(child, kAXRoleAttribute) as? String
+                        if role == kAXWindowRole || role == kAXSheetRole { windows.append(child) }
+                    }
+                    // Some independent-looking WeChat windows are exposed as sheets
+                    // attached to a parent instead of appearing in AXWindows.
+                    for window in windows {
+                        AXUIElementSetMessagingTimeout(window, 0.25)
+                        let children = AXRead.value(window, kAXChildrenAttribute) as? [AXUIElement] ?? []
+                        for child in children {
+                            AXUIElementSetMessagingTimeout(child, 0.15)
+                            if AXRead.value(child, kAXRoleAttribute) as? String == kAXSheetRole { windows.append(child) }
+                        }
+                    }
+                }
                 let before = items.count
                 var windowDetails: [[String: Any]] = []
+                var candidateKeys = Set<String>()
                 for window in windows {
+                    AXUIElementSetMessagingTimeout(window, 0.25)
+                    let key = AXRead.key(pid: app.processIdentifier, element: window)
+                    guard candidateKeys.insert(key).inserted else { continue }
                     AXUIElementSetMessagingTimeout(window, 0.25)
                     let role = AXRead.value(window, kAXRoleAttribute) as? String
                     let subrole = AXRead.value(window, kAXSubroleAttribute) as? String
                     let size = AXRead.size(window) ?? .zero
                     windowDetails.append(["role": role ?? "", "subrole": subrole ?? "", "width": size.width, "height": size.height, "id": AXRead.windowID(window) ?? 0])
-                    guard role == nil || role == kAXWindowRole else { continue }
+                    let isWeChatDialog = hosts.contains(app.bundleIdentifier ?? "") &&
+                        (role == kAXSheetRole) && AXRead.windowID(window) != nil
+                    guard role == nil || role == kAXWindowRole || isWeChatDialog else { continue }
                     guard subrole != kAXFloatingWindowSubrole else { continue }
                     guard (size == .zero) || (size.width >= 70 && size.height >= 70) else { continue }
-                    let key = AXRead.key(pid: app.processIdentifier, element: window)
                     guard seen.insert(key).inserted else { continue }
                     let title = (AXRead.value(window, kAXTitleAttribute) as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     let item = WindowItem(
                         key: key, pid: app.processIdentifier, windowID: AXRead.windowID(window),
                         application: app, element: window, appName: app.localizedName ?? "应用",
-                        title: title.isEmpty ? "未命名窗口 · \(Int(size.width)) × \(Int(size.height))" : title,
+                        title: windowTitle(title, application: app, size: size),
                         minimized: AXRead.bool(window, kAXMinimizedAttribute) == true, size: size
                     )
                     items.append(item)
                     cached[key] = item
                 }
-                diagnostics.append([
-                    "bundleID": app.bundleIdentifier ?? "", "pid": app.processIdentifier,
-                    "activationPolicy": app.activationPolicy.rawValue, "axError": readResult.rawValue,
-                    "reportedWindows": windows.count, "listedWindows": items.count - before, "windows": windowDetails
-                ])
                 for item in cached.values where item.pid == app.processIdentifier && !seen.contains(item.key) {
                     guard let element = item.element,
                           item.windowID == AXRead.windowID(element),
-                          item.windowID.map({ order[$0] != nil }) == true || AXRead.bool(element, kAXMinimizedAttribute) == true || app.isHidden else { continue }
+                          item.windowID.map(liveWindowIDs.contains) == true || AXRead.bool(element, kAXMinimizedAttribute) == true || app.isHidden else { continue }
                     items.append(item)
                     seen.insert(item.key)
                 }
+                diagnostics.append([
+                    "bundleID": app.bundleIdentifier ?? "", "pid": app.processIdentifier,
+                    "activationPolicy": app.activationPolicy.rawValue, "axError": readResult.rawValue,
+                    "reportedWindows": reportedWindows.count, "candidateWindows": candidateKeys.count,
+                    "listedWindows": items.count - before, "windows": windowDetails,
+                    "systemWindows": allCGWindows.filter {
+                        ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == app.processIdentifier
+                    }.compactMap { row -> [String: Any]? in
+                        guard let bounds = row[kCGWindowBounds as String] as? [String: Any],
+                              let width = bounds["Width"] as? NSNumber, let height = bounds["Height"] as? NSNumber,
+                              width.doubleValue >= 70, height.doubleValue >= 70 else { return nil }
+                        return ["id": row[kCGWindowNumber as String] ?? 0,
+                                "width": width, "height": height,
+                                "layer": row[kCGWindowLayer as String] ?? 0]
+                    }
+                ])
                 let titles = items.filter { $0.pid == app.processIdentifier && $0.element != nil }.map(\.title)
                 if ApplicationEntryPolicy.shouldInclude(bundleID: app.bundleIdentifier, isRegular: app.activationPolicy == .regular, windowTitles: titles) {
                     let name = app.localizedName ?? "应用"
