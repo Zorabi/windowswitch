@@ -88,7 +88,10 @@ final class PreferencesWindow: NSWindowController, NSWindowDelegate {
     }
 
     func restoreAfterSwitcher() {
-        guard suspendedForSwitcher else { return }
+        // Restoring while our app is still active can make settings become its
+        // next key window. Keep it suspended until the foreground handoff ends.
+        guard suspendedForSwitcher,
+              NSWorkspace.shared.frontmostApplication?.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
         suspendedForSwitcher = false
         window?.orderBack(nil)
     }
@@ -338,8 +341,7 @@ final class PreferencesWindow: NSWindowController, NSWindowDelegate {
                 privacyRow("rectangle.slash", "无需屏幕录制", "使用窗口名称与应用图标，不截取屏幕画面。"), divider(),
                 privacyRow("internaldrive", "数据保留在本机", "不上传窗口信息；诊断记录不包含窗口标题或聊天内容。"), divider(),
                 privacyRow("cursorarrow.click", "由你决定切换目标", "只有选择窗口后，窗序才会发出聚焦或打开请求。")
-            ]),
-            ProductStyle.label("部分应用可能只提供当前窗口信息。首次使用微信时，可分别点选一次主窗口和小程序，让窗序识别它们。", size: 12, color: .secondaryLabelColor)
+            ])
         ], spacing: 18))
     }
 

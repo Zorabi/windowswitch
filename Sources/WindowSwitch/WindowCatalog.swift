@@ -285,8 +285,10 @@ final class WindowCatalog {
                 if !success {
                     NSLog("Window focus unconfirmed: pid=%d activate=%d raise=%d main=%d focus=%d", item.pid, activation, raised.rawValue, main.rawValue, focused.rawValue)
                 }
-                let message = success ? nil : "未能确认窗口已切换。请再试一次，或先手动打开该窗口。"
-                DispatchQueue.main.async { completion(message) }
+                // AX confirmation is diagnostic only: some applications do not
+                // report focus reliably even after accepting the switch request.
+                // Recency still changes only when focus was actually confirmed.
+                DispatchQueue.main.async { completion(nil) }
             }
         }
     }
