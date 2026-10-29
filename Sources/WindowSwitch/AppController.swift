@@ -100,6 +100,7 @@ final class AppController: NSObject {
                 else { switcher.step(reverse: reverse) }
                 return
             }
+            catalog.cancelPendingReopen()
             catalog.noteFocusedWindow()
             let id = UUID()
             sessionSourcePID = NSWorkspace.shared.frontmostApplication?.processIdentifier
@@ -144,6 +145,7 @@ final class AppController: NSObject {
     }
 
     private func cancel(restoreFocus: Bool = true) {
+        catalog.cancelPendingReopen()
         session = nil
         sessionSourcePID = nil
         scanWaiters.removeAll()
