@@ -6,6 +6,7 @@ import Carbon
 import WindowFocus
 
 enum ApplicationEntryPolicy {
+    static let weChatBundleIDs: Set<String> = ["com.tencent.xinWeChat", "com.tencent.flue.WeChatAppEx", "com.tencent.flue.WeApp"]
     static let weChatMainTitles: Set<String> = ["微信", "WeChat", "Weixin"]
     static func shouldInclude(bundleID: String?, isRegular: Bool, windowTitles: [String]) -> Bool {
         guard isRegular, bundleID != "com.tencent.flue.WeApp" else { return false }
@@ -28,6 +29,7 @@ struct WindowItem {
     let size: CGSize
 
     var isLocalSettings: Bool { key == "local:settings" }
+    var isWeChat: Bool { ApplicationEntryPolicy.weChatBundleIDs.contains(application.bundleIdentifier ?? "") }
 
     var isWeChatMain: Bool {
         application.bundleIdentifier == "com.tencent.xinWeChat" && (element == nil || ApplicationEntryPolicy.weChatMainTitles.contains(title))
@@ -77,13 +79,16 @@ enum AXRead {
 }
 
 final class WindowCatalog {
+    var onWindowFocused: ((WindowItem, Date) -> Void)?
     private let queue = DispatchQueue(label: "dongx.windowswitch.windows", qos: .userInitiated)
+    private let windowCommandQueue = DispatchQueue(label: "dongx.windowswitch.window-commands", qos: .userInteractive)
     private let focusQueue = DispatchQueue(label: "dongx.windowswitch.focus", qos: .userInteractive)
     private var recency = WindowRecency()
     private var cached: [String: WindowItem] = [:]
     private var observers: [pid_t: AXObserver] = [:]
     // Accessed only on the main thread, along with focus request delivery.
     private var pendingReopenID: UUID?
+    private var activeFocusRequest: WindowFocusRequest?
 
     private func windowTitle(_ title: String, application: NSRunningApplication, size: CGSize) -> String {
         guard title.isEmpty else { return title }
@@ -127,6 +132,9 @@ final class WindowCatalog {
         guard AXUIElementGetPid(element, &pid) == .success,
               let app = NSRunningApplication(processIdentifier: pid) else { return }
         let now = Date()
+        let wasFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
+        let onlyTarget = activeFocusRequest?.isPending == true && activeFocusRequest?.pid == app.processIdentifier
+        let expectedID = activeFocusRequest?.targetWindowID
         // Capture the element delivered by AX. Reading the frontmost application
         // later can lose a window when several windows are created in succession.
         queue.async { [self] in
@@ -136,19 +144,34 @@ final class WindowCatalog {
             let window = isWindow ? element : AXRead.element(element, kAXFocusedWindowAttribute)
             guard let window else { return }
             remember(window, application: app)
-            if notification == kAXFocusedWindowChangedNotification,
-               NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier {
+            if notification == kAXFocusedWindowChangedNotification, wasFrontmost {
                 let key = AXRead.key(pid: app.processIdentifier, element: window)
+                guard !onlyTarget || (expectedID != nil && cached[key]?.windowID == expectedID) else { return }
                 recency.recordWindow(key: key, pid: app.processIdentifier,
                     isPrimary: cached[key]?.isWeChatMain == true, at: now)
+                if let item = cached[key] { publishFocusedWindow(item, at: now) }
             }
         }
+    }
+
+    func shouldRecordWindowUse(_ item: WindowItem) -> Bool {
+        guard let request = activeFocusRequest, request.isPending, request.pid == item.pid else { return true }
+        // Activation can expose the old main window before the target is ready.
+        // Verified focus and actual AX events publish their own timestamps.
+        return false
+    }
+
+    private func publishFocusedWindow(_ item: WindowItem, at date: Date) {
+        // UI MRU delivery must not wait behind another full catalog scan.
+        DispatchQueue.main.async { [weak self] in self?.onWindowFocused?(item, date) }
     }
 
     func noteFocusedWindow() {
         guard let app = NSWorkspace.shared.frontmostApplication,
               app.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
         let now = Date()
+        let onlyTarget = activeFocusRequest?.isPending == true && activeFocusRequest?.pid == app.processIdentifier
+        let expectedID = activeFocusRequest?.targetWindowID
         queue.async { [self] in
             recency.recordApplication(pid: app.processIdentifier, at: now)
             let source = AXUIElementCreateApplication(app.processIdentifier)
@@ -156,18 +179,22 @@ final class WindowCatalog {
             if let window = AXRead.element(source, kAXFocusedWindowAttribute) {
                 remember(window, application: app)
                 let key = AXRead.key(pid: app.processIdentifier, element: window)
-                recency.recordWindow(key: key, pid: app.processIdentifier, isPrimary: cached[key]?.isWeChatMain == true, at: now)
+                if !onlyTarget || (expectedID != nil && cached[key]?.windowID == expectedID) {
+                    recency.recordWindow(key: key, pid: app.processIdentifier, isPrimary: cached[key]?.isWeChatMain == true, at: now)
+                    if let item = cached[key] { publishFocusedWindow(item, at: now) }
+                }
             }
             observe(app)
         }
     }
 
     func noteLocalWindowUse(key: String, pid: pid_t) {
-        queue.async { [self] in recency.recordWindow(key: key, pid: pid, isPrimary: false, at: Date()) }
+        let now = Date()
+        queue.async { [self] in recency.recordWindow(key: key, pid: pid, isPrimary: false, at: now) }
     }
 
     func load(additionalItems: [WindowItem] = [], completion: @escaping ([WindowItem]) -> Void) {
-        let hosts: Set<String> = ["com.tencent.xinWeChat", "com.tencent.flue.WeChatAppEx", "com.tencent.flue.WeApp"]
+        let hosts = ApplicationEntryPolicy.weChatBundleIDs
         let apps = NSWorkspace.shared.runningApplications.filter {
             !$0.isTerminated && ($0.activationPolicy == .regular || hosts.contains($0.bundleIdentifier ?? "")) && $0.bundleIdentifier != Bundle.main.bundleIdentifier
         }
@@ -301,10 +328,18 @@ final class WindowCatalog {
         }
     }
 
-    func cancelPendingReopen() { pendingReopenID = nil }
+    func cancelPendingFocus() {
+        pendingReopenID = nil
+        activeFocusRequest?.cancel()
+        activeFocusRequest = nil
+    }
 
-    private func reopenWeChatMain(_ item: WindowItem, completion: @escaping (String?) -> Void) {
+    func notePanelRelease(_ reason: String) { activeFocusRequest?.mark("panel_" + reason) }
+
+    private func reopenWeChatMain(_ item: WindowItem, request: WindowFocusRequest,
+                                  onFronted: @escaping () -> Void, completion: @escaping (String?) -> Void) {
         guard let url = item.application.bundleURL else {
+            request.finish("application_url_unavailable")
             completion("无法定位该应用，请从访达中打开。")
             return
         }
@@ -312,29 +347,34 @@ final class WindowCatalog {
         pendingReopenID = id
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = false
+        request.mark("reopen_requested")
         configuration.createsNewApplicationInstance = false
         NSWorkspace.shared.openApplication(at: url, configuration: configuration) { [weak self] _, error in
             DispatchQueue.main.async {
-                guard let self, self.pendingReopenID == id else { return }
+                guard let self, self.pendingReopenID == id, !request.isCancelled else { return }
+                request.mark("reopen_returned")
                 if let error {
                     self.pendingReopenID = nil
+                    request.finish("reopen_failed")
                     completion("打开应用失败：\(error.localizedDescription)")
                 } else {
-                    self.waitForWeChatMain(item, requestID: id, attempt: 0, completion: completion)
+                    self.waitForWeChatMain(item, requestID: id, request: request, attempt: 0, onFronted: onFronted, completion: completion)
                 }
             }
         }
     }
 
-    private func waitForWeChatMain(_ item: WindowItem, requestID: UUID, attempt: Int,
-                                   completion: @escaping (String?) -> Void) {
-        guard pendingReopenID == requestID else { return }
+    private func waitForWeChatMain(_ item: WindowItem, requestID: UUID, request: WindowFocusRequest, attempt: Int,
+                                   onFronted: @escaping () -> Void, completion: @escaping (String?) -> Void) {
+        guard pendingReopenID == requestID, !request.isCancelled else { return }
         guard !item.application.isTerminated else {
             pendingReopenID = nil
+            request.finish("application_exited")
             completion("目标应用已经退出，请重新选择窗口。")
             return
         }
         focusQueue.async { [self] in
+            guard !request.isCancelled else { return }
             let source = AXUIElementCreateApplication(item.pid)
             AXUIElementSetMessagingTimeout(source, 0.15)
             var windows = AXRead.value(source, kAXWindowsAttribute) as? [AXUIElement] ?? []
@@ -345,6 +385,7 @@ final class WindowCatalog {
             var found: WindowItem?
             var seen = Set<String>()
             for window in windows {
+                guard !request.isCancelled else { return }
                 AXUIElementSetMessagingTimeout(window, 0.15)
                 let key = AXRead.key(pid: item.pid, element: window)
                 guard seen.insert(key).inserted,
@@ -358,54 +399,239 @@ final class WindowCatalog {
             }
             let target = found
             DispatchQueue.main.async { [self] in
-                guard pendingReopenID == requestID else { return }
+                guard pendingReopenID == requestID, !request.isCancelled else { return }
                 if let target {
+                    request.updateTarget(target.windowID)
+                    request.mark("reopen_main_found")
                     pendingReopenID = nil
                     if let window = target.element {
                         queue.async { [self] in remember(window, application: target.application) }
                     }
                     // Use the same single-window focus path as an existing window.
-                    focus(target, completion: completion)
+                    focusWeChatWindow(target, request: request, onFronted: onFronted, completion: completion)
                 } else if attempt < 12 {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-                        self?.waitForWeChatMain(item, requestID: requestID, attempt: attempt + 1, completion: completion)
+                        self?.waitForWeChatMain(item, requestID: requestID, request: request, attempt: attempt + 1, onFronted: onFronted, completion: completion)
                     }
                 } else {
                     pendingReopenID = nil
                     NSLog("WeChat main window unavailable after background reopen: pid=%d", item.pid)
+                    request.finish("reopen_unconfirmed")
                     completion(nil)
                 }
             }
         }
     }
 
-    func focus(_ item: WindowItem, completion: @escaping (String?) -> Void) {
-        cancelPendingReopen()
-        guard let selectedElement = item.element else {
-            if item.isWeChatMain {
-                reopenWeChatMain(item, completion: completion)
+    private func focusWeChatWindow(_ item: WindowItem, request: WindowFocusRequest,
+                                   onFronted: @escaping () -> Void, completion: @escaping (String?) -> Void) {
+        guard !request.isCancelled else { return }
+        guard item.windowID != nil, !item.application.isTerminated else {
+            request.finish("target_unavailable")
+            completion("目标窗口不可用，请重新选择。")
+            return
+        }
+        if item.minimized {
+            focusQueue.async { [self] in
+                guard !request.isCancelled else { return }
+                request.mark("restore_started")
+                let source = AXUIElementCreateApplication(item.pid)
+                AXUIElementSetMessagingTimeout(source, 0.15)
+                let candidates = AXRead.value(source, kAXWindowsAttribute) as? [AXUIElement] ?? []
+                let current = candidates.first { AXRead.windowID($0) == item.windowID }
+                let cached = item.element.flatMap { AXRead.windowID($0) == item.windowID ? $0 : nil }
+                guard !request.isCancelled else { return }
+                guard let window = current ?? cached else {
+                    request.finish("restore_window_unavailable")
+                    DispatchQueue.main.async { if !request.isCancelled { completion("目标窗口暂时不可用，请重新选择。") } }
+                    return
+                }
+                AXUIElementSetMessagingTimeout(window, 0.15)
+                let restored = AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+                request.mark("restore_returned", result: restored.rawValue)
+                guard !request.isCancelled else { return }
+                guard restored == .success else {
+                    request.finish("restore_failed")
+                    DispatchQueue.main.async { if !request.isCancelled { completion("目标应用未接受窗口恢复请求。") } }
+                    return
+                }
+                activateWeChatWindow(item, request: request, onFronted: onFronted, completion: completion)
+            }
+        } else {
+            activateWeChatWindow(item, request: request, onFronted: onFronted, completion: completion)
+        }
+    }
+
+    private func activateWeChatWindow(_ item: WindowItem, request: WindowFocusRequest,
+                                     onFronted: @escaping () -> Void, completion: @escaping (String?) -> Void) {
+        request.mark("activation_queued")
+        windowCommandQueue.async { [self] in
+            guard !request.isCancelled else { return }
+            request.mark("activation_started")
+            guard !item.application.isTerminated, let id = item.windowID else {
+                request.finish("target_unavailable")
+                DispatchQueue.main.async { if !request.isCancelled { completion("目标窗口不可用，请重新选择。") } }
                 return
             }
+            let activation = WSActivateWindow(item.pid, id)
+            request.mark("activation_returned", result: activation)
+            guard !request.isCancelled else { return }
+            guard activation == noErr else {
+                request.finish("activation_failed")
+                DispatchQueue.main.async { if !request.isCancelled { onFronted(); completion(nil) } }
+                return
+            }
+            // This step transfers key focus; fronting by window ID alone does not.
+            let key = WSMakeWindowKey(item.pid, id)
+            request.mark("key_returned", result: key)
+            guard !request.isCancelled else { return }
+            DispatchQueue.main.async {
+                guard !request.isCancelled else { return }
+                request.mark("handoff_callback")
+                onFronted()
+                completion(nil)
+            }
+            guard key == noErr else { request.finish("key_unconfirmed"); return }
+            focusQueue.async { [self] in
+                // The app may have accepted the WindowServer requests while its
+                // own key/main window still names the chat window. Complete the
+                // app-internal raise before checking focus, as in AltTab's pipeline.
+                raiseWeChatTarget(item, request: request)
+                guard !request.isCancelled else { return }
+                focusQueue.asyncAfter(deadline: .now() + 0.05) { [self] in
+                    verifyWeChatFocus(item, request: request)
+                }
+            }
+        }
+    }
+
+    private func raiseWeChatTarget(_ item: WindowItem, request: WindowFocusRequest) {
+        guard !request.isCancelled, request.age < 0.35,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == item.pid,
+              let id = item.windowID else { return }
+        request.mark("target_raise_started")
+        var result: AXError = .invalidUIElement
+        if let cached = item.element {
+            AXUIElementSetMessagingTimeout(cached, 0.12)
+            if AXRead.windowID(cached) == id, !request.isCancelled {
+                result = AXUIElementPerformAction(cached, kAXRaiseAction as CFString)
+                request.mark("cached_raise_returned", result: result.rawValue)
+            }
+        }
+        // Rebind an invalid AX proxy by exact ID once. Never select the current
+        // chat window merely because it is the only window AX happens to expose.
+        if result == .invalidUIElement, !request.isCancelled, request.age < 0.35 {
+            let source = AXUIElementCreateApplication(item.pid)
+            AXUIElementSetMessagingTimeout(source, 0.12)
+            let windows = AXRead.value(source, kAXWindowsAttribute) as? [AXUIElement] ?? []
+            if let fresh = windows.first(where: { AXRead.windowID($0) == id }),
+               !request.isCancelled, request.age < 0.35,
+               NSWorkspace.shared.frontmostApplication?.processIdentifier == item.pid {
+                AXUIElementSetMessagingTimeout(fresh, 0.12)
+                result = AXUIElementPerformAction(fresh, kAXRaiseAction as CFString)
+                request.mark("fresh_raise_returned", result: result.rawValue)
+                queue.async { [self] in remember(fresh, application: item.application) }
+            }
+        }
+    }
+
+    private func verifyWeChatFocus(_ item: WindowItem, request: WindowFocusRequest) {
+        guard !request.isCancelled else { return }
+        guard request.age < 0.6 else { request.finish("verification_expired"); return }
+        request.mark("verification_started")
+        let source = AXUIElementCreateApplication(item.pid)
+        AXUIElementSetMessagingTimeout(source, 0.12)
+        let actual = AXRead.element(source, kAXFocusedWindowAttribute)
+        let actualID = actual.flatMap(AXRead.windowID)
+        let confirmed = actualID == item.windowID
+        request.mark("focus_observed", windowID: actualID ?? 0)
+        guard !request.isCancelled else { return }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == item.pid else {
+            request.finish("foreground_changed")
+            return
+        }
+        // Retry only the selected window's internal raise, and only with evidence
+        // that it has key focus but remains covered. Never replay the key event.
+        if confirmed, request.age < 0.35, isWindowCovered(item), let window = actual,
+           AXRead.windowID(window) == item.windowID, !request.isCancelled {
+            AXUIElementSetMessagingTimeout(window, 0.12)
+            let raised = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+            request.mark("occlusion_raise_returned", result: raised.rawValue)
+        }
+        guard !request.isCancelled else { return }
+        if confirmed {
+            let usedAt = Date()
+            publishFocusedWindow(item, at: usedAt)
             queue.async { [self] in
-                recency.recordWindow(key: item.key, pid: item.pid, isPrimary: item.isWeChatMain, at: Date())
+                recency.recordWindow(key: item.key, pid: item.pid, isPrimary: item.isWeChatMain, at: usedAt)
+            }
+        }
+        request.finish(confirmed ? "confirmed" : "fronted_key_unconfirmed")
+    }
+
+    private func isWindowCovered(_ item: WindowItem) -> Bool {
+        let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        guard let index = rows.firstIndex(where: { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == item.windowID }),
+              let bounds = rows[index][kCGWindowBounds as String] as? [String: Any],
+              let target = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return false }
+        return rows[..<index].contains { row in
+            guard (row[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  (row[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1 > 0.05,
+                  let bounds = row[kCGWindowBounds as String] as? [String: Any],
+                  let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return false }
+            return rect.width >= 70 && rect.height >= 70 && rect.intersects(target)
+        }
+    }
+
+    func focus(_ item: WindowItem, requestedAt: TimeInterval = ProcessInfo.processInfo.systemUptime,
+               onFronted: @escaping () -> Void = {}, completion: @escaping (String?) -> Void) {
+        cancelPendingFocus()
+        let request = WindowFocusRequest(pid: item.pid, windowID: item.windowID, startedAt: requestedAt, isWeChat: item.isWeChat)
+        activeFocusRequest = request
+        guard let selectedElement = item.element else {
+            if item.isWeChatMain {
+                reopenWeChatMain(item, request: request, onFronted: onFronted, completion: completion)
+                return
             }
             // This is an explicitly selected application entry, not a fallback
             // from a failed window focus. Closed main windows need a reopen event.
             guard let url = item.application.bundleURL else {
+                request.finish("application_url_unavailable")
                 completion("无法定位该应用，请从访达中打开。")
                 return
             }
             let configuration = NSWorkspace.OpenConfiguration()
             configuration.activates = true
             configuration.createsNewApplicationInstance = false
+            request.mark("application_reopen_requested")
             NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, error in
-                DispatchQueue.main.async { completion(error.map { "打开应用失败：\($0.localizedDescription)" }) }
+                DispatchQueue.main.async {
+                    guard !request.isCancelled else { return }
+                    request.finish(error == nil ? "application_opened" : "application_open_failed")
+                    if error == nil {
+                        let usedAt = Date()
+                        self.publishFocusedWindow(item, at: usedAt)
+                        self.queue.async { [self] in
+                            self.recency.recordWindow(key: item.key, pid: item.pid, isPrimary: item.isWeChatMain, at: usedAt)
+                        }
+                    }
+                    onFronted()
+                    completion(error.map { "打开应用失败：\($0.localizedDescription)" })
+                }
             }
             return
         }
+        if item.isWeChat {
+            focusWeChatWindow(item, request: request, onFronted: onFronted, completion: completion)
+            return
+        }
+        request.mark("legacy_queued")
         focusQueue.async { [self] in
+            guard !request.isCancelled else { return }
+            request.mark("legacy_started")
             guard !item.application.isTerminated else {
-                DispatchQueue.main.async { completion("目标应用已经退出，请重新选择窗口。") }
+                request.finish("application_exited")
+                DispatchQueue.main.async { if !request.isCancelled { completion("目标应用已经退出，请重新选择窗口。") } }
                 return
             }
             let source = AXUIElementCreateApplication(item.pid)
@@ -417,29 +643,42 @@ final class WindowCatalog {
             }
             let stableCached = item.windowID != nil && AXRead.windowID(selectedElement) == item.windowID
             guard let window = currentTarget ?? (stableCached ? selectedElement : nil) else {
-                DispatchQueue.main.async { completion("目标窗口已经关闭，请重新选择。") }
+                request.finish("window_closed")
+                DispatchQueue.main.async { if !request.isCancelled { completion("目标窗口已经关闭，请重新选择。") } }
                 return
             }
+            guard !request.isCancelled else { return }
             AXUIElementSetMessagingTimeout(window, 0.2)
             if AXRead.bool(window, kAXMinimizedAttribute) == true {
                 let restored = AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
                 guard restored == .success else {
-                    DispatchQueue.main.async { completion("目标应用未接受窗口恢复请求。") }
+                    request.finish("restore_failed")
+                    DispatchQueue.main.async { if !request.isCancelled { completion("目标应用未接受窗口恢复请求。") } }
                     return
                 }
             }
-            // Name the chosen window before process activation. Never reopen the app,
-            // activate all windows, or minimize sibling windows to simulate isolation.
+            guard !request.isCancelled else { return }
+            // Other applications retain the existing AX focus path.
             let main = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+            guard !request.isCancelled else { return }
             let focused = AXUIElementSetAttributeValue(source, kAXFocusedWindowAttribute as CFString, window)
+            guard !request.isCancelled else { return }
             let activation = WSActivateFrontWindowOnly(item.pid)
+            request.mark("legacy_activation_returned", result: activation)
+            DispatchQueue.main.async { if !request.isCancelled { onFronted() } }
+            guard !request.isCancelled else { return }
             let raised = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
             focusQueue.asyncAfter(deadline: .now() + 0.18) { [self] in
+                guard !request.isCancelled else { return }
                 let actual = AXRead.element(source, kAXFocusedWindowAttribute)
                 let confirmed = (actual.map { CFEqual($0, window) } ?? false) || AXRead.bool(window, kAXFocusedAttribute) == true
-                let success = activation == noErr && confirmed
+                let success = activation == noErr && confirmed &&
+                    NSWorkspace.shared.frontmostApplication?.processIdentifier == item.pid
+                guard !request.isCancelled else { return }
+                request.finish(success ? "confirmed" : "legacy_unconfirmed")
                 if success {
                     let usedAt = Date()
+                    publishFocusedWindow(item, at: usedAt)
                     queue.async { [self] in recency.recordWindow(key: item.key, pid: item.pid, isPrimary: item.isWeChatMain, at: usedAt) }
                 }
                 if !success {
@@ -448,7 +687,7 @@ final class WindowCatalog {
                 // AX confirmation is diagnostic only: some applications do not
                 // report focus reliably even after accepting the switch request.
                 // Recency still changes only when focus was actually confirmed.
-                DispatchQueue.main.async { completion(nil) }
+                DispatchQueue.main.async { if !request.isCancelled { completion(nil) } }
             }
         }
     }
