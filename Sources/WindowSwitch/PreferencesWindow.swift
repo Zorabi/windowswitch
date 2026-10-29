@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 dongx.
 import AppKit
+import UniformTypeIdentifiers
 
 final class PreferencesWindow: NSWindowController, NSWindowDelegate {
     enum Page: Int, CaseIterable {
-        case general, shortcuts, privacy, about
-        var title: String { ["通用", "快捷键", "权限与隐私", "关于窗序"][rawValue] }
-        var symbol: String { ["slider.horizontal.3", "keyboard", "hand.raised", "info.circle"][rawValue] }
+        case general, shortcuts, filters, privacy, about
+        var title: String { ["通用", "快捷键", "应用过滤", "权限与隐私", "关于窗序"][rawValue] }
+        var symbol: String { ["slider.horizontal.3", "keyboard", "line.3.horizontal.decrease.circle", "hand.raised", "info.circle"][rawValue] }
         var subtitle: String {
-            ["以窗口为单位，保持你的工作节奏。", "熟悉的操作，由你定义。", "只为切换窗口，使用必要的权限。", "让每个窗口，各归其位。"][rawValue]
+            ["以窗口为单位，保持你的工作节奏。", "熟悉的操作，由你定义。", "决定哪些应用和重开入口参与切换。", "只为切换窗口，使用必要的权限。", "让每个窗口，各归其位。"][rawValue]
         }
     }
+    var onFiltersChanged: (() -> Void)?
     var onRecord: (() -> Void)?
     var onClearShortcut: (() -> Void)?
     var onClearSearchShortcut: (() -> Void)?
@@ -232,6 +234,7 @@ final class PreferencesWindow: NSWindowController, NSWindowDelegate {
         switch page {
         case .general: body = generalPage()
         case .shortcuts: body = shortcutsPage()
+        case .filters: body = filtersPage()
         case .privacy: body = privacyPage()
         case .about: body = aboutPage()
         }
@@ -322,9 +325,74 @@ final class PreferencesWindow: NSWindowController, NSWindowDelegate {
                 divider(),
                 row("转入固定搜索", "松键模式下也不必一直按住修饰键。", control: ProductStyle.label("搜索快捷键 / 空格 / ⌘F", size: 12, weight: .medium))
             ], spacing: 14),
-            ProductStyle.label("⌘, 设置    ⌘1–4 设置页面    ⌘M 最小化设置    ⌘Q 退出", size: 12, color: .secondaryLabelColor),
+            ProductStyle.label("⌘, 设置    ⌘1–5 设置页面    ⌘M 最小化设置    ⌘Q 退出", size: 12, color: .secondaryLabelColor),
             ProductStyle.label("设置为 ⌘Tab 会接管系统应用切换。按住切换修饰键时，按 F 或空格，即可松开修饰键继续搜索。", size: 12, color: .secondaryLabelColor)
         ], spacing: 18))
+    }
+
+    private func filtersPage() -> NSStackView {
+        let filters = ApplicationFilters.shared
+        let list = ProductStyle.stack([], spacing: 0)
+        for app in filters.applications() {
+            let icon = NSImageView(image: app.url.map { NSWorkspace.shared.icon(forFile: $0.path) } ?? NSImage(named: NSImage.applicationIconName) ?? NSImage())
+            icon.imageScaling = .scaleProportionallyUpOrDown
+            icon.widthAnchor.constraint(equalToConstant: 28).isActive = true
+            icon.heightAnchor.constraint(equalToConstant: 28).isActive = true
+            let name = ProductStyle.label(app.name, size: 13, weight: .medium)
+            name.lineBreakMode = .byTruncatingTail
+            name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let picker = ApplicationFilterPicker(mode: filters.mode(for: app.id)) { [weak self] mode in
+                if let url = app.url { filters.remember(url) }
+                filters.set(mode, for: app.id)
+                self?.onFiltersChanged?()
+            }
+            picker.setAccessibilityLabel("\(app.name)的过滤方式")
+            picker.widthAnchor.constraint(equalToConstant: 124).isActive = true
+            let entry = ProductStyle.stack([icon, name, picker], vertical: false, spacing: 12)
+            name.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            entry.heightAnchor.constraint(equalToConstant: 50).isActive = true
+            list.addArrangedSubview(entry)
+            entry.widthAnchor.constraint(equalTo: list.widthAnchor).isActive = true
+        }
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        let document = ApplicationFilterListView()
+        scroll.documentView = document
+        list.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(list)
+        NSLayoutConstraint.activate([
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            list.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 16),
+            list.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -16),
+            list.topAnchor.constraint(equalTo: document.topAnchor, constant: 8),
+            list.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -8)
+        ])
+        document.translatesAutoresizingMaskIntoConstraints = false
+        scroll.heightAnchor.constraint(equalToConstant: 300).isActive = true
+        let surface = SurfaceView()
+        ProductStyle.pin(scroll, in: surface, inset: 0)
+        let add = ProductButton("添加应用…", kind: .quiet) { [weak self] in
+            guard let self, let window = self.window else { return }
+            let panel = NSOpenPanel()
+            panel.allowedContentTypes = [.application]
+            panel.directoryURL = URL(fileURLWithPath: "/Applications")
+            panel.canChooseDirectories = false
+            panel.allowsMultipleSelection = false
+            panel.prompt = "添加"
+            panel.beginSheetModal(for: window) { [weak self] response in
+                guard response == .OK, let url = panel.url else { return }
+                filters.remember(url)
+                self?.select(.filters)
+            }
+        }
+        return fit(ProductStyle.stack([
+            surface,
+            ProductStyle.label("屏蔽重开：保留已有窗口，隐藏没有窗口时的打开入口。\n完全屏蔽：该应用的所有条目均不参与切换和搜索。", size: 12, color: .secondaryLabelColor),
+            add,
+            ProductStyle.label("显示正在运行及已添加的应用，规则自动保存，仅影响窗序。", size: 12, color: .secondaryLabelColor)
+        ], spacing: 16))
     }
 
     private func privacyPage() -> NSStackView {

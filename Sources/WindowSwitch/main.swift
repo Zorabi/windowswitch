@@ -42,7 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         close.target = controller
         windowMenu.addItem(close)
         windowMenu.addItem(.separator())
-        for (index, title) in ["通用", "快捷键", "权限与隐私", "关于窗序"].enumerated() {
+        for (index, title) in PreferencesWindow.Page.allCases.map(\.title).enumerated() {
             let item = NSMenuItem(title: title, action: #selector(AppController.showSettingsSection(_:)), keyEquivalent: String(index + 1))
             item.target = controller
             item.tag = index

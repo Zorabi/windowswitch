@@ -53,7 +53,7 @@ final class AppController: NSObject {
             guard let self, self.trusted else { return }
             self.catalog.noteFocusedWindow()
             if self.session == nil {
-                self.cachedItems = self.immediateWindowItems()
+                self.cachedItems = self.immediateWindowItems(applyFilters: false)
                 self.refreshWindowSnapshot(force: true)
             }
             if !self.switcher.panel.isVisible { self.preferences?.restoreAfterSwitcher() }
@@ -165,6 +165,7 @@ final class AppController: NSObject {
     }
 
     private func focus(_ item: WindowItem) {
+        guard ApplicationFilters.shared.allows(item) else { cancel(); return }
         cancel(restoreFocus: false)
         if item.isLocalSettings {
             preferences?.window?.deminiaturize(nil)
@@ -237,15 +238,16 @@ final class AppController: NSObject {
             self.scanInFlight = false
             let waiters = self.scanWaiters
             self.scanWaiters.removeAll()
-            let current = self.immediateWindowItems()
+            let current = self.immediateWindowItems(applyFilters: false)
             self.cachedItems = current
-            waiters.forEach { $0(current) }
+            let visible = current.filter { ApplicationFilters.shared.allows($0) }
+            waiters.forEach { $0(visible) }
         }
     }
 
     /// Reconcile cached IDs with lightweight system metadata, without AX messages.
     /// This also replaces a newly closed WeChat main window at its original position.
-    private func immediateWindowItems() -> [WindowItem] {
+    private func immediateWindowItems(applyFilters: Bool = true) -> [WindowItem] {
         guard !cachedItems.isEmpty else { return [] }
         let rows = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         let ids = Set(rows.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value })
@@ -278,7 +280,7 @@ final class AppController: NSObject {
                 items.insert(items.remove(at: index), at: 0)
             }
         }
-        return items
+        return applyFilters ? items.filter { ApplicationFilters.shared.allows($0) } : items
     }
 
     @objc private func togglePause() {
@@ -319,6 +321,10 @@ final class AppController: NSObject {
         if session != nil { cancel(restoreFocus: false) }
         if preferences == nil {
             let settings = PreferencesWindow()
+            settings.onFiltersChanged = { [weak self] in
+                guard let self else { return }
+                self.switcher.updateItems(self.immediateWindowItems())
+            }
             settings.onClearShortcut = { [weak self] in self?.clearShortcut(search: false) }
             settings.onClearSearchShortcut = { [weak self] in self?.clearShortcut(search: true) }
             settings.onFocused = { [weak self] in
