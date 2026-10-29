@@ -82,6 +82,8 @@ final class WindowCatalog {
     private var recency = WindowRecency()
     private var cached: [String: WindowItem] = [:]
     private var observers: [pid_t: AXObserver] = [:]
+    // Accessed only on the main thread, along with focus request delivery.
+    private var pendingReopenID: UUID?
 
     private func windowTitle(_ title: String, application: NSRunningApplication, size: CGSize) -> String {
         guard title.isEmpty else { return title }
@@ -299,8 +301,91 @@ final class WindowCatalog {
         }
     }
 
+    func cancelPendingReopen() { pendingReopenID = nil }
+
+    private func reopenWeChatMain(_ item: WindowItem, completion: @escaping (String?) -> Void) {
+        guard let url = item.application.bundleURL else {
+            completion("无法定位该应用，请从访达中打开。")
+            return
+        }
+        let id = UUID()
+        pendingReopenID = id
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = false
+        configuration.createsNewApplicationInstance = false
+        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { [weak self] _, error in
+            DispatchQueue.main.async {
+                guard let self, self.pendingReopenID == id else { return }
+                if let error {
+                    self.pendingReopenID = nil
+                    completion("打开应用失败：\(error.localizedDescription)")
+                } else {
+                    self.waitForWeChatMain(item, requestID: id, attempt: 0, completion: completion)
+                }
+            }
+        }
+    }
+
+    private func waitForWeChatMain(_ item: WindowItem, requestID: UUID, attempt: Int,
+                                   completion: @escaping (String?) -> Void) {
+        guard pendingReopenID == requestID else { return }
+        guard !item.application.isTerminated else {
+            pendingReopenID = nil
+            completion("目标应用已经退出，请重新选择窗口。")
+            return
+        }
+        focusQueue.async { [self] in
+            let source = AXUIElementCreateApplication(item.pid)
+            AXUIElementSetMessagingTimeout(source, 0.15)
+            var windows = AXRead.value(source, kAXWindowsAttribute) as? [AXUIElement] ?? []
+            for attribute in [kAXMainWindowAttribute, kAXFocusedWindowAttribute] {
+                if let window = AXRead.element(source, attribute) { windows.append(window) }
+            }
+            windows.append(contentsOf: AXRead.value(source, kAXChildrenAttribute) as? [AXUIElement] ?? [])
+            var found: WindowItem?
+            var seen = Set<String>()
+            for window in windows {
+                AXUIElementSetMessagingTimeout(window, 0.15)
+                let key = AXRead.key(pid: item.pid, element: window)
+                guard seen.insert(key).inserted,
+                      AXRead.value(window, kAXRoleAttribute) as? String == kAXWindowRole else { continue }
+                let title = (AXRead.value(window, kAXTitleAttribute) as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard ApplicationEntryPolicy.weChatMainTitles.contains(title) else { continue }
+                found = WindowItem(key: key, pid: item.pid, windowID: AXRead.windowID(window),
+                    application: item.application, element: window, appName: item.appName, title: title,
+                    minimized: AXRead.bool(window, kAXMinimizedAttribute) == true, size: AXRead.size(window) ?? .zero)
+                break
+            }
+            let target = found
+            DispatchQueue.main.async { [self] in
+                guard pendingReopenID == requestID else { return }
+                if let target {
+                    pendingReopenID = nil
+                    if let window = target.element {
+                        queue.async { [self] in remember(window, application: target.application) }
+                    }
+                    // Use the same single-window focus path as an existing window.
+                    focus(target, completion: completion)
+                } else if attempt < 12 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                        self?.waitForWeChatMain(item, requestID: requestID, attempt: attempt + 1, completion: completion)
+                    }
+                } else {
+                    pendingReopenID = nil
+                    NSLog("WeChat main window unavailable after background reopen: pid=%d", item.pid)
+                    completion(nil)
+                }
+            }
+        }
+    }
+
     func focus(_ item: WindowItem, completion: @escaping (String?) -> Void) {
+        cancelPendingReopen()
         guard let selectedElement = item.element else {
+            if item.isWeChatMain {
+                reopenWeChatMain(item, completion: completion)
+                return
+            }
             queue.async { [self] in
                 recency.recordWindow(key: item.key, pid: item.pid, isPrimary: item.isWeChatMain, at: Date())
             }
