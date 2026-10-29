@@ -81,6 +81,7 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     private var localMonitor: Any?
     private var loading = false
     private var closing = false
+    private var presentationID = UUID()
     private var previousApplication: NSRunningApplication?
     var selected: WindowItem? {
         filtered.indices.contains(table.selectedRow) ? filtered[table.selectedRow] : nil
@@ -232,7 +233,10 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     }
 
     func show(_ items: [WindowItem], index: Int, searching: Bool, shortcut: String, commitOnRelease: Bool = false, loading: Bool = false) {
-        let wasVisible = panel.isVisible
+        let wasVisible = panel.isVisible && !closing
+        presentationID = UUID()
+        panel.alphaValue = 1
+        panel.ignoresMouseEvents = false
         self.loading = loading
         if !wasVisible {
             let front = NSWorkspace.shared.frontmostApplication
@@ -287,9 +291,13 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     }
 
     func updateItems(_ items: [WindowItem]) {
-        guard panel.isVisible else { return }
+        guard panel.isVisible, !closing else { return }
         let selectedKey = selected?.key
-        all = items
+        let refreshed = Dictionary(items.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
+        let existingKeys = Set(all.map(\.key))
+        // Refresh metadata and remove closed entries without changing this
+        // session's navigation order. Newly discovered entries go at the end.
+        all = all.compactMap { refreshed[$0.key] } + items.filter { !existingKeys.contains($0.key) }
         applyFilter(index: max(0, table.selectedRow), preserving: selectedKey)
     }
 
@@ -324,10 +332,33 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         footer.stringValue = "直接键入搜索    Tab / ↑ ↓ 选择    ↩ 切换    Esc 取消"
     }
 
+    /// Visually leave immediately, releasing key ownership once the target fronts.
+    /// The bounded lease also covers unavailable, cancelled, or slow targets.
+    func beginFocusHandoff(onRelease: ((String) -> Void)? = nil) -> () -> Void {
+        guard panel.isVisible else { return {} }
+        closing = true
+        spinner.stopAnimation(nil)
+        panel.alphaValue = 0
+        panel.ignoresMouseEvents = true
+        if let localMonitor { NSEvent.removeMonitor(localMonitor) }
+        localMonitor = nil
+        let id = presentationID
+        let release: (String) -> Void = { [weak self] reason in
+            guard let self, self.presentationID == id, self.closing else { return }
+            onRelease?(reason)
+            self.hide()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { release("lease_timeout") }
+        return { release("target_fronted") }
+    }
+
     func hide(restoreFocus: Bool = false) {
+        presentationID = UUID()
         closing = true
         spinner.stopAnimation(nil)
         panel.orderOut(nil)
+        panel.alphaValue = 1
+        panel.ignoresMouseEvents = false
         if let localMonitor { NSEvent.removeMonitor(localMonitor) }
         localMonitor = nil
         if restoreFocus, NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Bundle.main.bundleIdentifier,
@@ -345,7 +376,7 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         table.scrollRowToVisible(row)
     }
 
-    func commit() { if let selected, !loading { onSelect?(selected) } }
+    func commit() { if let selected, !loading, !closing { onSelect?(selected) } }
     func controlTextDidChange(_ obj: Notification) {
         onSearch?()
         applyFilter(index: 0)

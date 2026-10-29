@@ -23,7 +23,10 @@ final class AppController: NSObject {
     private var trusted = false
     private var sampledInitialFocus = false
     private var lastSwitchError: String?
+    private var actionReceivedAt: TimeInterval?
     private var cachedItems: [WindowItem] = []
+    private var displayRecency = WindowRecency()
+    private var observedFocus: [pid_t: (key: String, date: Date)] = [:]
     private var scanInFlight = false
     private var lastScan = Date.distantPast
     private var scanWaiters: [([WindowItem]) -> Void] = []
@@ -35,8 +38,17 @@ final class AppController: NSObject {
         }
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "rectangle.on.rectangle", accessibilityDescription: "窗序")
+        catalog.onWindowFocused = { [weak self] item, date in
+            self?.recordDisplayUse(item, at: date)
+        }
         keyboard.onAction = { [weak self] action in
-            DispatchQueue.main.async { self?.handle(action) }
+            let receivedAt = ProcessInfo.processInfo.systemUptime
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.actionReceivedAt = receivedAt
+                defer { self.actionReceivedAt = nil }
+                self.handle(action)
+            }
         }
         switcher.onWillActivate = { [weak self] in self?.preferences?.suspendIfInBackground() }
         switcher.onDidHide = { [weak self] in self?.preferences?.restoreAfterSwitcher() }
@@ -51,6 +63,7 @@ final class AppController: NSObject {
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] _ in
             guard let self, self.trusted else { return }
+            self.recordForegroundWindowUse()
             self.catalog.noteFocusedWindow()
             if self.session == nil {
                 self.cachedItems = self.immediateWindowItems(applyFilters: false)
@@ -66,6 +79,7 @@ final class AppController: NSObject {
     }
 
     func stop() {
+        catalog.cancelPendingFocus()
         keyboard.stop()
         timer?.invalidate()
         if let activationObserver { NSWorkspace.shared.notificationCenter.removeObserver(activationObserver) }
@@ -100,7 +114,8 @@ final class AppController: NSObject {
                 else { switcher.step(reverse: reverse) }
                 return
             }
-            catalog.cancelPendingReopen()
+            catalog.cancelPendingFocus()
+            recordForegroundWindowUse()
             catalog.noteFocusedWindow()
             let id = UUID()
             sessionSourcePID = NSWorkspace.shared.frontmostApplication?.processIdentifier
@@ -111,7 +126,7 @@ final class AppController: NSObject {
             pendingSteps = reverse ? -1 : 1
             let immediate = immediateWindowItems()
             loading = cachedItems.isEmpty
-            let index = immediate.isEmpty ? 0 : ((pendingSteps % immediate.count) + immediate.count) % immediate.count
+            let index = initialSelectionIndex(in: immediate, steps: pendingSteps)
             switcher.show(immediate, index: index, searching: false, shortcut: keyboard.shortcut.label,
                           commitOnRelease: keyboard.commitOnRelease, loading: loading)
             refreshWindowSnapshot(force: true) { [weak self] items in
@@ -125,7 +140,7 @@ final class AppController: NSObject {
                     self.cancel()
                     return
                 }
-                let index = self.searchPinned ? 0 : ((self.pendingSteps % items.count) + items.count) % items.count
+                let index = self.searchPinned ? 0 : self.initialSelectionIndex(in: items, steps: self.pendingSteps)
                 if self.pendingCommit { self.focus(items[index]) }
                 else { self.switcher.show(items, index: index, searching: self.searchPinned, shortcut: self.keyboard.shortcut.label, commitOnRelease: self.keyboard.commitOnRelease) }
             }
@@ -144,8 +159,8 @@ final class AppController: NSObject {
         }
     }
 
-    private func cancel(restoreFocus: Bool = true) {
-        catalog.cancelPendingReopen()
+    private func cancel(restoreFocus: Bool = true, keepPanelForHandoff: Bool = false) {
+        catalog.cancelPendingFocus()
         session = nil
         sessionSourcePID = nil
         scanWaiters.removeAll()
@@ -154,7 +169,7 @@ final class AppController: NSObject {
         pendingCommit = false
         searchPinned = false
         keyboard.finish()
-        switcher.hide(restoreFocus: restoreFocus)
+        if !keepPanelForHandoff { switcher.hide(restoreFocus: restoreFocus) }
     }
 
     private func localSettingsItems() -> [WindowItem] {
@@ -168,14 +183,19 @@ final class AppController: NSObject {
 
     private func focus(_ item: WindowItem) {
         guard ApplicationFilters.shared.allows(item) else { cancel(); return }
-        cancel(restoreFocus: false)
+        let requestedAt = actionReceivedAt ?? ProcessInfo.processInfo.systemUptime
+        cancel(restoreFocus: false, keepPanelForHandoff: !item.isLocalSettings)
         if item.isLocalSettings {
             preferences?.window?.deminiaturize(nil)
             showPreferences()
             return
         }
-        catalog.focus(item) { [weak self] error in
-            guard let self else { return }
+        let releasePanel = switcher.beginFocusHandoff { [weak self] reason in
+            self?.catalog.notePanelRelease(reason)
+        }
+        catalog.focus(item, requestedAt: requestedAt, onFronted: releasePanel) { [weak self] error in
+            releasePanel()
+            guard let self, self.session == nil else { return }
             if let error { self.showResult(error) }
             else {
                 self.lastSwitchError = nil
@@ -212,6 +232,7 @@ final class AppController: NSObject {
         keyboard.panelPresented = true
         pendingCommit = false
         searchPinned = true
+        recordForegroundWindowUse()
         catalog.noteFocusedWindow()
         let immediate = immediateWindowItems()
         loading = cachedItems.isEmpty
@@ -236,6 +257,9 @@ final class AppController: NSObject {
         catalog.load(additionalItems: localSettingsItems()) { [weak self] items in
             guard let self else { return }
             self.cachedItems = items
+            let livePIDs = Set(NSWorkspace.shared.runningApplications.map(\.processIdentifier))
+            self.displayRecency.retain(windowKeys: Set(items.map(\.key)), pids: livePIDs)
+            self.observedFocus = self.observedFocus.filter { livePIDs.contains($0.key) }
             self.lastScan = Date()
             self.scanInFlight = false
             let waiters = self.scanWaiters
@@ -270,6 +294,13 @@ final class AppController: NSObject {
             if let item, seen.insert(item.key).inserted { items.append(item) }
         }
         if let settings, seen.insert(settings.key).inserted { items.append(settings) }
+        items = items.enumerated().sorted { left, right in
+            let leftDate = displayRecency.date(key: left.element.key, pid: left.element.pid,
+                isApplication: left.element.element == nil, prefersPrimary: left.element.isWeChatMain)
+            let rightDate = displayRecency.date(key: right.element.key, pid: right.element.pid,
+                isApplication: right.element.element == nil, prefersPrimary: right.element.isWeChatMain)
+            return leftDate == rightDate ? left.offset < right.offset : leftDate > rightDate
+        }.map(\.element)
         let foregroundPID = switcher.panel.isVisible ? sessionSourcePID : NSWorkspace.shared.frontmostApplication?.processIdentifier
         if let foregroundPID {
             let firstKnown = rows.first { row in
@@ -278,11 +309,49 @@ final class AppController: NSObject {
                 items.contains { $0.windowID == (row[kCGWindowNumber as String] as? NSNumber)?.uint32Value }
             }
             let frontID = (firstKnown?[kCGWindowNumber as String] as? NSNumber)?.uint32Value
-            if let index = items.firstIndex(where: { $0.pid == foregroundPID && (frontID == nil || $0.windowID == frontID) }) {
-                items.insert(items.remove(at: index), at: 0)
+            let observedIndex = observedFocus[foregroundPID].flatMap { focus in
+                items.firstIndex { $0.pid == foregroundPID && $0.key == focus.key }
             }
+            let index = observedIndex ?? items.firstIndex(where: { $0.pid == foregroundPID && (frontID == nil || $0.windowID == frontID) })
+            if let index { items.insert(items.remove(at: index), at: 0) }
         }
         return applyFilters ? items.filter { ApplicationFilters.shared.allows($0) } : items
+    }
+
+    private func recordDisplayUse(_ item: WindowItem, at date: Date) {
+        guard !item.application.isTerminated else { return }
+        displayRecency.recordWindow(key: item.key, pid: item.pid, isPrimary: item.isWeChatMain, at: date)
+        if date >= (observedFocus[item.pid]?.date ?? .distantPast) {
+            observedFocus[item.pid] = (item.key, date)
+        }
+        if session == nil { cachedItems = immediateWindowItems(applyFilters: false) }
+    }
+
+    private func recordForegroundWindowUse() {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              app.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
+        let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        let front = rows.first { row in
+            (row[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == app.processIdentifier &&
+            cachedItems.contains { $0.windowID == (row[kCGWindowNumber as String] as? NSNumber)?.uint32Value }
+        }
+        let id = (front?[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+        let observed = observedFocus[app.processIdentifier].flatMap { focus in
+            cachedItems.first { $0.pid == app.processIdentifier && $0.key == focus.key &&
+                ($0.windowID.map { knownID in rows.contains { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == knownID } } ?? false) }
+        }
+        let frontItem = id.flatMap { id in cachedItems.first { $0.pid == app.processIdentifier && $0.windowID == id } }
+        if let item = observed ?? frontItem, catalog.shouldRecordWindowUse(item) {
+            recordDisplayUse(item, at: Date())
+        }
+    }
+
+    private func initialSelectionIndex(in items: [WindowItem], steps: Int) -> Int {
+        guard !items.isEmpty else { return 0 }
+        // If the current application was filtered out, the most recent eligible
+        // window is already the first alternative; do not skip it.
+        let offset = items.first?.pid == sessionSourcePID || steps <= 0 ? steps : steps - 1
+        return ((offset % items.count) + items.count) % items.count
     }
 
     @objc private func togglePause() {
@@ -320,7 +389,8 @@ final class AppController: NSObject {
     }
 
     @objc func showPreferences() {
-        if session != nil { cancel(restoreFocus: false) }
+        catalog.cancelPendingFocus()
+        if session != nil || switcher.panel.isVisible { cancel(restoreFocus: false) }
         if preferences == nil {
             let settings = PreferencesWindow()
             settings.onFiltersChanged = { [weak self] in
@@ -330,7 +400,9 @@ final class AppController: NSObject {
             settings.onClearShortcut = { [weak self] in self?.clearShortcut(search: false) }
             settings.onClearSearchShortcut = { [weak self] in self?.clearShortcut(search: true) }
             settings.onFocused = { [weak self] in
-                self?.catalog.noteLocalWindowUse(key: "local:settings", pid: NSRunningApplication.current.processIdentifier)
+                guard let self else { return }
+                self.catalog.noteLocalWindowUse(key: "local:settings", pid: NSRunningApplication.current.processIdentifier)
+                if let item = self.localSettingsItems().first { self.recordDisplayUse(item, at: Date()) }
             }
             settings.onRecord = { [weak self] in self?.recordShortcut() }
             settings.onRecordSearch = { [weak self] in self?.recordShortcut(search: true) }
