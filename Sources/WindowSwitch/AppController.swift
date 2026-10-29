@@ -21,6 +21,7 @@ final class AppController: NSObject {
     private var paused = UserDefaults.standard.bool(forKey: "switchingPaused")
     private var trusted = false
     private var sampledInitialFocus = false
+    private var lastSwitchError: String?
 
     func start() {
         PreferencesWindow.applyAppearance()
@@ -46,6 +47,7 @@ final class AppController: NSObject {
         ) { [weak self] _ in
             guard let self, self.trusted else { return }
             self.catalog.noteFocusedWindow()
+            if !self.switcher.panel.isVisible { self.preferences?.restoreAfterSwitcher() }
         }
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.checkPermission() }
         checkPermission()
@@ -102,7 +104,6 @@ final class AppController: NSObject {
                 self.loading = false
                 guard !items.isEmpty else {
                     self.cancel()
-                    self.showResult("未找到可切换的窗口。请打开一个应用窗口后重试。")
                     return
                 }
                 let index = self.searchPinned ? 0 : ((self.pendingSteps % items.count) + items.count) % items.count
@@ -151,13 +152,24 @@ final class AppController: NSObject {
             return
         }
         catalog.focus(item) { [weak self] error in
-            if let error { self?.showResult(error) }
+            guard let self else { return }
+            if let error { self.showResult(error) }
+            else {
+                self.lastSwitchError = nil
+                self.statusItem.button?.toolTip = "窗序"
+                self.preferences?.showFeedback("")
+                self.updateMenu()
+            }
+            if !self.switcher.panel.isVisible { self.preferences?.restoreAfterSwitcher() }
         }
     }
 
     private func showResult(_ message: String) {
-        showPreferences()
+        // A failed or unconfirmed focus must not activate our own settings window.
+        lastSwitchError = message
+        statusItem.button?.toolTip = "窗序：" + message
         preferences?.showFeedback(message)
+        updateMenu()
     }
 
     @objc func searchWindows() {
@@ -203,6 +215,12 @@ final class AppController: NSObject {
         let heading = NSMenuItem(title: "窗序 · \(keyboard.shortcut.label)", action: nil, keyEquivalent: "")
         heading.isEnabled = false
         menu.addItem(heading)
+        if let lastSwitchError {
+            let error = NSMenuItem(title: "上次切换：" + lastSwitchError, action: nil, keyEquivalent: "")
+            error.isEnabled = false
+            menu.addItem(error)
+            menu.addItem(.separator())
+        }
         for (title, action) in [("搜索窗口…", #selector(searchWindows)), ("设置…", #selector(showPreferences)), (paused ? "恢复快捷键" : "暂停快捷键", #selector(togglePause))] {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
             item.target = self
