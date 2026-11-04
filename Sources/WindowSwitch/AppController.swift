@@ -272,7 +272,7 @@ final class AppController: NSObject {
     }
 
     /// Reconcile cached IDs with lightweight system metadata, without AX messages.
-    /// This also replaces a newly closed WeChat main window at its original position.
+    /// This also replaces a newly closed primary window at its original position.
     private func immediateWindowItems(applyFilters: Bool = true) -> [WindowItem] {
         guard !cachedItems.isEmpty else { return [] }
         let rows = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
@@ -287,18 +287,17 @@ final class AppController: NSObject {
             let item: WindowItem?
             if old.isLocalSettings { item = settings }
             else if let current = live.first(where: { $0.key == old.key }) { item = current }
-            else if old.isWeChatMain, !live.contains(where: { $0.pid == old.pid && $0.isWeChatMain }) {
-                item = WindowItem(key: "app:\(old.pid)", pid: old.pid, windowID: nil, application: old.application,
-                    element: nil, appName: old.appName, title: old.appName, minimized: false, size: .zero)
+            else if old.isPrimaryWindow, !live.contains(where: { $0.pid == old.pid && $0.isPrimaryWindow }) {
+                item = old.primaryReopenEntry
             } else { item = nil }
             if let item, seen.insert(item.key).inserted { items.append(item) }
         }
         if let settings, seen.insert(settings.key).inserted { items.append(settings) }
         items = items.enumerated().sorted { left, right in
             let leftDate = displayRecency.date(key: left.element.key, pid: left.element.pid,
-                isApplication: left.element.element == nil, prefersPrimary: left.element.isWeChatMain)
+                isApplication: left.element.element == nil, prefersPrimary: left.element.isPrimaryWindow)
             let rightDate = displayRecency.date(key: right.element.key, pid: right.element.pid,
-                isApplication: right.element.element == nil, prefersPrimary: right.element.isWeChatMain)
+                isApplication: right.element.element == nil, prefersPrimary: right.element.isPrimaryWindow)
             return leftDate == rightDate ? left.offset < right.offset : leftDate > rightDate
         }.map(\.element)
         let foregroundPID = switcher.panel.isVisible ? sessionSourcePID : NSWorkspace.shared.frontmostApplication?.processIdentifier
@@ -312,13 +311,13 @@ final class AppController: NSObject {
             let observedIndex = observedFocus[foregroundPID].flatMap { focus in
                 items.firstIndex {
                     $0.pid == foregroundPID && $0.key == focus.key &&
-                    !($0.isWeChatMain && $0.element == nil)
+                    $0.canRepresentForegroundWindow
                 }
             }
-            // WeChat can remain the foreground process briefly after Cmd+W.
-            // Its reopen action is not a focused window and keeps its MRU rank.
+            // An application can remain the foreground process briefly after Cmd+W.
+            // A primary-window reopen action keeps its MRU rank instead of being fronted.
             let index = observedIndex ?? items.firstIndex(where: {
-                $0.pid == foregroundPID && !($0.isWeChatMain && $0.element == nil) &&
+                $0.pid == foregroundPID && $0.canRepresentForegroundWindow &&
                 (frontID == nil || $0.windowID == frontID)
             })
             if let index { items.insert(items.remove(at: index), at: 0) }
@@ -328,7 +327,7 @@ final class AppController: NSObject {
 
     private func recordDisplayUse(_ item: WindowItem, at date: Date) {
         guard !item.application.isTerminated else { return }
-        displayRecency.recordWindow(key: item.key, pid: item.pid, isPrimary: item.isWeChatMain, at: date)
+        displayRecency.recordWindow(key: item.key, pid: item.pid, isPrimary: item.isPrimaryWindow, at: date)
         if date >= (observedFocus[item.pid]?.date ?? .distantPast) {
             observedFocus[item.pid] = (item.key, date)
         }

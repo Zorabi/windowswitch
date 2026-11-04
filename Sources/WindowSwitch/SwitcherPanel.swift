@@ -296,12 +296,11 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         let refreshed = Dictionary(items.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
         var usedKeys = Set<String>()
         // Refresh metadata and remove closed entries without changing this
-        // session's navigation order. A closed WeChat main window and its reopen
+        // session's navigation order. A closed primary window and its reopen
         // entry occupy the same slot; distinct live windows still use exact IDs.
         let existing = all.compactMap { old -> WindowItem? in
             let replacement = refreshed[old.key] ?? items.first {
-                old.isWeChatMain && $0.isWeChatMain && old.pid == $0.pid &&
-                (old.element == nil || $0.element == nil) && !usedKeys.contains($0.key)
+                $0.canReplaceInSwitcher(old) && !usedKeys.contains($0.key)
             }
             guard let replacement, usedKeys.insert(replacement.key).inserted else { return nil }
             if selectedKey == old.key { selectedKey = replacement.key }
@@ -435,7 +434,7 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
             cell.detail.stringValue = "窗序"
             cell.badge.stringValue = item.minimized ? "已最小化" : ""
         } else if item.element == nil {
-            cell.detail.stringValue = item.application.bundleIdentifier == "com.tencent.xinWeChat" ? "微信 · 重新打开主窗口" : "打开应用"
+            cell.detail.stringValue = item.policy.applicationEntryDetail
             cell.badge.stringValue = "重新打开"
         } else {
             cell.detail.stringValue = item.appName

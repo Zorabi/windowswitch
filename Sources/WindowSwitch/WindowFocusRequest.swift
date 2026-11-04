@@ -16,11 +16,11 @@ final class WindowFocusRequest {
     // Accessed only on outputQueue; a late old request cannot replace newer evidence.
     private static var newestStarts: [String: TimeInterval] = [:]
 
-    init(pid: pid_t, windowID: UInt32?, startedAt: TimeInterval, isWeChat: Bool) {
+    init(pid: pid_t, windowID: UInt32?, startedAt: TimeInterval, diagnosticFile: String) {
         self.pid = pid
         self.windowID = windowID
         self.startedAt = startedAt
-        diagnosticFile = isWeChat ? "last-wechat-focus.json" : "last-focus.json"
+        self.diagnosticFile = diagnosticFile
         mark("main_received")
     }
 
