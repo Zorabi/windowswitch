@@ -85,6 +85,7 @@ final class WindowCatalog {
     private let queue = DispatchQueue(label: "dongx.windowswitch.windows", qos: .userInitiated)
     private let windowCommandQueue = DispatchQueue(label: "dongx.windowswitch.window-commands", qos: .userInteractive)
     private let focusQueue = DispatchQueue(label: "dongx.windowswitch.focus", qos: .userInteractive)
+    private let verificationQueue = DispatchQueue(label: "dongx.windowswitch.focus-verification", qos: .userInitiated)
     private var recency = WindowRecency()
     private var cached: [String: WindowItem] = [:]
     private var observers: [pid_t: AXObserver] = [:]
@@ -503,7 +504,7 @@ final class WindowCatalog {
                 // app-internal raise before checking focus, as in AltTab's pipeline.
                 raiseTargetWindow(item, request: request)
                 guard !request.isCancelled else { return }
-                focusQueue.asyncAfter(deadline: .now() + 0.05) { [self] in
+                verificationQueue.asyncAfter(deadline: .now() + 0.05) { [self] in
                     verifyWindowFocus(item, request: request)
                 }
             }
@@ -648,13 +649,21 @@ final class WindowCatalog {
             }
             let source = AXUIElementCreateApplication(item.pid)
             AXUIElementSetMessagingTimeout(source, 0.2)
-            let current = AXRead.value(source, kAXWindowsAttribute) as? [AXUIElement] ?? []
-            let currentTarget = current.first { candidate in
-                if let id = item.windowID { return AXRead.windowID(candidate) == id }
-                return CFEqual(candidate, selectedElement)
+            AXUIElementSetMessagingTimeout(selectedElement, 0.2)
+            let target: AXUIElement?
+            if let id = item.windowID, AXRead.windowID(selectedElement) == id,
+               AXRead.value(selectedElement, kAXRoleAttribute) != nil {
+                target = selectedElement
+                request.mark("cached_target_resolved")
+            } else {
+                let windows = AXRead.value(source, kAXWindowsAttribute) as? [AXUIElement] ?? []
+                target = windows.first { candidate in
+                    if let id = item.windowID { return AXRead.windowID(candidate) == id }
+                    return CFEqual(candidate, selectedElement)
+                }
+                request.mark("enumerated_target_resolved")
             }
-            let stableCached = item.windowID != nil && AXRead.windowID(selectedElement) == item.windowID
-            guard let window = currentTarget ?? (stableCached ? selectedElement : nil) else {
+            guard let window = target else {
                 request.finish("window_closed")
                 DispatchQueue.main.async { if !request.isCancelled { completion("目标窗口已经关闭，请重新选择。") } }
                 return
@@ -669,38 +678,58 @@ final class WindowCatalog {
                     return
                 }
             }
+            request.mark("restore_checked")
             guard !request.isCancelled else { return }
             // The default policy uses the standard AX focus path.
             let main = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+            request.mark("main_returned", result: main.rawValue)
             guard !request.isCancelled else { return }
             let focused = AXUIElementSetAttributeValue(source, kAXFocusedWindowAttribute as CFString, window)
+            request.mark("focused_returned", result: focused.rawValue)
             guard !request.isCancelled else { return }
             let activation = WSActivateFrontWindowOnly(item.pid)
             request.mark("legacy_activation_returned", result: activation)
-            DispatchQueue.main.async { if !request.isCancelled { onFronted() } }
+            DispatchQueue.main.async {
+                guard !request.isCancelled else { return }
+                request.mark("handoff_callback")
+                onFronted()
+            }
             guard !request.isCancelled else { return }
             let raised = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-            focusQueue.asyncAfter(deadline: .now() + 0.18) { [self] in
-                guard !request.isCancelled else { return }
-                let actual = AXRead.element(source, kAXFocusedWindowAttribute)
-                let confirmed = (actual.map { CFEqual($0, window) } ?? false) || AXRead.bool(window, kAXFocusedAttribute) == true
-                let success = activation == noErr && confirmed &&
-                    NSWorkspace.shared.frontmostApplication?.processIdentifier == item.pid
-                guard !request.isCancelled else { return }
-                request.finish(success ? "confirmed" : "legacy_unconfirmed")
-                if success {
-                    let usedAt = Date()
-                    publishFocusedWindow(item, at: usedAt)
-                    queue.async { [self] in recency.recordWindow(key: item.key, pid: item.pid, isPrimary: item.isPrimaryWindow, at: usedAt) }
-                }
-                if !success {
-                    NSLog("Window focus unconfirmed: pid=%d activate=%d raise=%d main=%d focus=%d", item.pid, activation, raised.rawValue, main.rawValue, focused.rawValue)
-                }
-                // AX confirmation is diagnostic only: some applications do not
-                // report focus reliably even after accepting the switch request.
-                // Recency still changes only when focus was actually confirmed.
-                DispatchQueue.main.async { if !request.isCancelled { completion(nil) } }
+            request.mark("raise_returned", result: raised.rawValue)
+            verificationQueue.async { [self] in
+                verifyAccessibilityFocus(item, window: window, source: source, request: request,
+                                         activation: activation, completion: completion)
             }
         }
+    }
+
+    private func verifyAccessibilityFocus(_ item: WindowItem, window: AXUIElement, source: AXUIElement,
+                                          request: WindowFocusRequest, activation: OSStatus,
+                                          canRetry: Bool = true, completion: @escaping (String?) -> Void) {
+        guard !request.isCancelled else { return }
+        request.mark("verification_started")
+        let actual = AXRead.element(source, kAXFocusedWindowAttribute)
+        let confirmed = (actual.map { CFEqual($0, window) } ?? false) || AXRead.bool(window, kAXFocusedAttribute) == true
+        let success = activation == noErr && confirmed &&
+            NSWorkspace.shared.frontmostApplication?.processIdentifier == item.pid
+        guard !request.isCancelled else { return }
+        if !success, canRetry, request.age < 0.6 {
+            request.mark("verification_retry_queued")
+            verificationQueue.asyncAfter(deadline: .now() + 0.18) { [self] in
+                verifyAccessibilityFocus(item, window: window, source: source, request: request,
+                                         activation: activation, canRetry: false, completion: completion)
+            }
+            return
+        }
+        if success {
+            let usedAt = Date()
+            publishFocusedWindow(item, at: usedAt)
+            queue.async { [self] in recency.recordWindow(key: item.key, pid: item.pid, isPrimary: item.isPrimaryWindow, at: usedAt) }
+        }
+        request.finish(success ? "confirmed" : "legacy_unconfirmed")
+        if !success { NSLog("Window focus unconfirmed: pid=%d activate=%d", item.pid, activation) }
+        // Confirmation is diagnostic only; it never reopens an application.
+        DispatchQueue.main.async { if !request.isCancelled { completion(nil) } }
     }
 }

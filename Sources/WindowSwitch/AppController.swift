@@ -81,7 +81,6 @@ final class AppController: NSObject {
             self.recordForegroundWindowUse()
             self.catalog.noteFocusedWindow()
             if self.session == nil {
-                self.cachedItems = self.immediateWindowItems(applyFilters: false)
                 self.refreshWindowSnapshot(force: true)
             }
             if !self.switcher.panel.isVisible { self.preferences?.restoreAfterSwitcher() }
@@ -461,7 +460,8 @@ final class AppController: NSObject {
         if date >= (observedFocus[item.pid]?.date ?? .distantPast) {
             observedFocus[item.pid] = (item.key, date)
         }
-        if session == nil { cachedItems = immediateWindowItems(applyFilters: false) }
+        // Delivery reconciles and sorts the cache when needed. Focus notifications
+        // only update history, so window scanning cannot delay the panel handoff.
     }
 
     private func recordForegroundWindowUse() {
