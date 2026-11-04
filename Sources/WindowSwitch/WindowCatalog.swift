@@ -15,14 +15,15 @@ struct WindowItem {
     let title: String
     let minimized: Bool
     let size: CGSize
+    var isLocalSettingsReopen = false
 
     var isLocalSettings: Bool { key == "local:settings" }
     var policy: ApplicationWindowPolicy {
         ApplicationWindowPolicy.forApplication(bundleID: application.bundleIdentifier)
     }
-    var isApplicationEntry: Bool { element == nil }
+    var isApplicationEntry: Bool { isLocalSettings ? isLocalSettingsReopen : element == nil }
     var isPrimaryWindow: Bool { policy.isPrimaryWindow(title: title, isApplicationEntry: isApplicationEntry) }
-    var canRepresentForegroundWindow: Bool { !isApplicationEntry || isLocalSettings }
+    var canRepresentForegroundWindow: Bool { !isApplicationEntry }
 
     var applicationReopenEntry: WindowItem {
         return WindowItem(key: "app:\(pid)", pid: pid, windowID: nil, application: application,
@@ -321,8 +322,8 @@ final class WindowCatalog {
             let liveKeys = Set(items.map(\.key))
             recency.retain(windowKeys: liveKeys, pids: livePIDs)
             items.sort { left, right in
-                let leftDate = recency.date(key: left.key, pid: left.pid, isApplication: left.element == nil, prefersPrimary: left.isPrimaryWindow)
-                let rightDate = recency.date(key: right.key, pid: right.pid, isApplication: right.element == nil, prefersPrimary: right.isPrimaryWindow)
+                let leftDate = recency.date(key: left.key, pid: left.pid, isApplication: left.isApplicationEntry, prefersPrimary: left.isPrimaryWindow)
+                let rightDate = recency.date(key: right.key, pid: right.pid, isApplication: right.isApplicationEntry, prefersPrimary: right.isPrimaryWindow)
                 if leftDate != rightDate { return leftDate > rightDate }
                 let leftOrder = left.windowID.flatMap { order[$0] } ?? Int.max
                 let rightOrder = right.windowID.flatMap { order[$0] } ?? Int.max

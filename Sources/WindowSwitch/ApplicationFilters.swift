@@ -36,7 +36,7 @@ final class ApplicationFilters {
         guard let bundleID = item.application.bundleIdentifier else { return true }
         switch mode(for: bundleID) {
         case .allowed: return true
-        case .hideReopen: return item.element != nil || item.isLocalSettings
+        case .hideReopen: return !item.isApplicationEntry
         case .hidden: return false
         }
     }
@@ -64,6 +64,9 @@ final class ApplicationFilters {
         for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
             guard let id = app.bundleIdentifier else { continue }
             apps[id] = Application(id: id, name: app.localizedName ?? id, url: app.bundleURL)
+        }
+        if let id = Bundle.main.bundleIdentifier {
+            apps[id] = Application(id: id, name: "窗序", url: Bundle.main.bundleURL)
         }
         if apps["com.apple.finder"] == nil {
             apps["com.apple.finder"] = Application(id: "com.apple.finder", name: "Finder", url: NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.finder"))

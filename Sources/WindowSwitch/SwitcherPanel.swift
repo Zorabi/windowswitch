@@ -432,7 +432,7 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         cell.title.stringValue = item.title
         if item.isLocalSettings {
             cell.detail.stringValue = "窗序"
-            cell.badge.stringValue = item.minimized ? "已最小化" : ""
+            cell.badge.stringValue = item.isLocalSettingsReopen ? "重新打开" : (item.minimized ? "已最小化" : "")
         } else if item.element == nil {
             cell.detail.stringValue = item.policy.applicationEntryDetail
             cell.badge.stringValue = "重新打开"

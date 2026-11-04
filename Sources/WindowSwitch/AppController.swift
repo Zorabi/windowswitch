@@ -310,8 +310,12 @@ final class AppController: NSObject {
     }
 
     private func localSettingsItems() -> [WindowItem] {
-        guard let preferences, preferences.hasOpenSettings, let window = preferences.window else { return [] }
         let app = NSRunningApplication.current
+        guard let preferences, preferences.hasOpenSettings, let window = preferences.window else {
+            return [WindowItem(key: "local:settings", pid: app.processIdentifier, windowID: nil,
+                application: app, element: nil, appName: "窗序", title: "窗序 · 设置",
+                minimized: false, size: .zero, isLocalSettingsReopen: true)]
+        }
         return [WindowItem(key: "local:settings", pid: app.processIdentifier,
             windowID: window.windowNumber > 0 ? CGWindowID(window.windowNumber) : nil,
             application: app, element: nil, appName: "窗序", title: "窗序 · 设置",
@@ -439,9 +443,9 @@ final class AppController: NSObject {
         if let settings, seen.insert(settings.key).inserted { items.append(settings) }
         items = items.enumerated().sorted { left, right in
             let leftDate = displayRecency.date(key: left.element.key, pid: left.element.pid,
-                isApplication: left.element.element == nil, prefersPrimary: left.element.isPrimaryWindow)
+                isApplication: left.element.isApplicationEntry, prefersPrimary: left.element.isPrimaryWindow)
             let rightDate = displayRecency.date(key: right.element.key, pid: right.element.pid,
-                isApplication: right.element.element == nil, prefersPrimary: right.element.isPrimaryWindow)
+                isApplication: right.element.isApplicationEntry, prefersPrimary: right.element.isPrimaryWindow)
             return leftDate == rightDate ? left.offset < right.offset : leftDate > rightDate
         }.map(\.element)
         let foregroundPID = switcher.panel.isVisible ? sessionSourcePID : NSWorkspace.shared.frontmostApplication?.processIdentifier
@@ -502,7 +506,8 @@ final class AppController: NSObject {
         guard !items.isEmpty else { return 0 }
         // If the current application was filtered out, the most recent eligible
         // window is already the first alternative; do not skip it.
-        let offset = items.first?.pid == sessionSourcePID || steps <= 0 ? steps : steps - 1
+        let hasCurrentWindow = items.first?.pid == sessionSourcePID && items.first?.canRepresentForegroundWindow == true
+        let offset = hasCurrentWindow || steps <= 0 ? steps : steps - 1
         return ((offset % items.count) + items.count) % items.count
     }
 
