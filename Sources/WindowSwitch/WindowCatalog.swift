@@ -22,17 +22,19 @@ struct WindowItem {
     }
     var isApplicationEntry: Bool { element == nil }
     var isPrimaryWindow: Bool { policy.isPrimaryWindow(title: title, isApplicationEntry: isApplicationEntry) }
-    var canRepresentForegroundWindow: Bool { !(isPrimaryWindow && isApplicationEntry) }
+    var canRepresentForegroundWindow: Bool { !isApplicationEntry }
 
-    var primaryReopenEntry: WindowItem? {
-        guard isPrimaryWindow else { return nil }
+    var applicationReopenEntry: WindowItem {
         return WindowItem(key: "app:\(pid)", pid: pid, windowID: nil, application: application,
             element: nil, appName: appName, title: appName, minimized: false, size: .zero)
     }
 
     func canReplaceInSwitcher(_ old: WindowItem) -> Bool {
-        pid == old.pid && isPrimaryWindow && old.isPrimaryWindow &&
-            (isApplicationEntry || old.isApplicationEntry)
+        guard pid == old.pid, isApplicationEntry != old.isApplicationEntry else { return false }
+        // Named primary windows reopen independently of other windows. Default
+        // application entries exist only when the last window has disappeared.
+        if !policy.primaryWindowTitles.isEmpty { return isPrimaryWindow && old.isPrimaryWindow }
+        return true
     }
 }
 

@@ -272,7 +272,7 @@ final class AppController: NSObject {
     }
 
     /// Reconcile cached IDs with lightweight system metadata, without AX messages.
-    /// This also replaces a newly closed primary window at its original position.
+    /// Closed windows become eligible application entries without waiting for AX.
     private func immediateWindowItems(applyFilters: Bool = true) -> [WindowItem] {
         guard !cachedItems.isEmpty else { return [] }
         let rows = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
@@ -281,15 +281,22 @@ final class AppController: NSObject {
         let live = cachedItems.filter {
             !$0.application.isTerminated && !$0.isLocalSettings && ($0.windowID.map(ids.contains) ?? true)
         }
+        let liveWindows = Dictionary(grouping: live.filter { !$0.isApplicationEntry }, by: \.pid)
         var items: [WindowItem] = []
         var seen = Set<String>()
         for old in cachedItems where !old.application.isTerminated {
             let item: WindowItem?
             if old.isLocalSettings { item = settings }
-            else if let current = live.first(where: { $0.key == old.key }) { item = current }
-            else if old.isPrimaryWindow, !live.contains(where: { $0.pid == old.pid && $0.isPrimaryWindow }) {
-                item = old.primaryReopenEntry
-            } else { item = nil }
+            else {
+                let titles = (liveWindows[old.pid] ?? []).map(\.title)
+                let includesReopen = old.policy.shouldIncludeApplicationEntry(
+                    isRegular: old.application.activationPolicy == .regular, windowTitles: titles)
+                if old.isApplicationEntry { item = includesReopen ? old : nil }
+                else if let current = live.first(where: { $0.key == old.key }) { item = current }
+                else if includesReopen, old.isPrimaryWindow || old.policy.primaryWindowTitles.isEmpty {
+                    item = old.applicationReopenEntry
+                } else { item = nil }
+            }
             if let item, seen.insert(item.key).inserted { items.append(item) }
         }
         if let settings, seen.insert(settings.key).inserted { items.append(settings) }
@@ -315,7 +322,7 @@ final class AppController: NSObject {
                 }
             }
             // An application can remain the foreground process briefly after Cmd+W.
-            // A primary-window reopen action keeps its MRU rank instead of being fronted.
+            // Reopen actions keep their MRU rank instead of being fronted.
             let index = observedIndex ?? items.firstIndex(where: {
                 $0.pid == foregroundPID && $0.canRepresentForegroundWindow &&
                 (frontID == nil || $0.windowID == frontID)

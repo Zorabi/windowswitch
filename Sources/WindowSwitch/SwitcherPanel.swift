@@ -296,8 +296,8 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         let refreshed = Dictionary(items.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
         var usedKeys = Set<String>()
         // Refresh metadata and remove closed entries without changing this
-        // session's navigation order. A closed primary window and its reopen
-        // entry occupy the same slot; distinct live windows still use exact IDs.
+        // session's navigation order. A closed window and its application entry
+        // occupy the same slot; distinct live windows still use exact IDs.
         let existing = all.compactMap { old -> WindowItem? in
             let replacement = refreshed[old.key] ?? items.first {
                 $0.canReplaceInSwitcher(old) && !usedKeys.contains($0.key)
