@@ -42,10 +42,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         close.target = controller
         windowMenu.addItem(close)
         windowMenu.addItem(.separator())
-        for (index, title) in PreferencesWindow.Page.allCases.map(\.title).enumerated() {
-            let item = NSMenuItem(title: title, action: #selector(AppController.showSettingsSection(_:)), keyEquivalent: String(index + 1))
+        for page in PreferencesWindow.Page.allCases {
+            let item = NSMenuItem(title: page.title, action: #selector(AppController.showSettingsSection(_:)), keyEquivalent: String(page.rawValue + 1))
             item.target = controller
-            item.tag = index
+            item.tag = page.rawValue
             windowMenu.addItem(item)
         }
         windowRoot.submenu = windowMenu

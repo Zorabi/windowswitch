@@ -5,11 +5,11 @@ import UniformTypeIdentifiers
 
 final class PreferencesWindow: NSWindowController, NSWindowDelegate {
     enum Page: Int, CaseIterable {
-        case general, shortcuts, filters, privacy, about
-        var title: String { ["通用", "快捷键", "应用过滤", "权限与隐私", "关于窗序"][rawValue] }
-        var symbol: String { ["slider.horizontal.3", "keyboard", "line.3.horizontal.decrease.circle", "hand.raised", "info.circle"][rawValue] }
+        case general, shortcuts, filters, privacy, statistics, about
+        var title: String { ["通用", "快捷键", "应用过滤", "权限与隐私", "使用统计", "关于窗序"][rawValue] }
+        var symbol: String { ["slider.horizontal.3", "keyboard", "line.3.horizontal.decrease.circle", "hand.raised", "chart.bar", "info.circle"][rawValue] }
         var subtitle: String {
-            ["以窗口为单位，保持你的工作节奏。", "熟悉的操作，由你定义。", "决定哪些应用和重开入口参与切换。", "只为切换窗口，使用必要的权限。", "让每个窗口，各归其位。"][rawValue]
+            ["以窗口为单位，保持你的工作节奏。", "熟悉的操作，由你定义。", "决定哪些应用和重开入口参与切换。", "只为切换窗口，使用必要的权限。", "查看切换次数与处理耗时，仅保存在本机。", "让每个窗口，各归其位。"][rawValue]
         }
     }
     var onFiltersChanged: (() -> Void)?
@@ -50,6 +50,10 @@ final class PreferencesWindow: NSWindowController, NSWindowDelegate {
     private var recording = false
     private var commitOnRelease = false
     private var suspendedForSwitcher = false
+    private let statisticsValues = (0..<6).map { _ in ProductStyle.label("—", size: 25, weight: .medium) }
+    private let statisticsReopens = ProductStyle.label("0", size: 14, weight: .medium)
+    private let statisticsSince = ProductStyle.label("", size: 11, color: .secondaryLabelColor)
+    private var statisticsSheet: ProductSheet?
 
     init() {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 650),
@@ -125,6 +129,7 @@ final class PreferencesWindow: NSWindowController, NSWindowDelegate {
         shortcutSummary.stringValue = shortcut
         if !recording || recordingSearch { shortcutButton.title = shortcut }
         if !recording || !recordingSearch { searchShortcutButton.title = searchShortcut }
+        if page == .statistics, window?.isVisible == true { refreshStatistics() }
     }
 
     func setRecording(_ value: Bool, search: Bool = false, hint: String? = nil) {
@@ -182,6 +187,7 @@ final class PreferencesWindow: NSWindowController, NSWindowDelegate {
             button.image = NSImage(systemSymbolName: page.symbol, accessibilityDescription: nil)
             button.imageScaling = .scaleProportionallyDown
             button.setAccessibilityLabel(page.title)
+            button.tag = page.rawValue
             button.heightAnchor.constraint(equalToConstant: 38).isActive = true
             navigation.append(button)
             nav.addArrangedSubview(button)
@@ -224,7 +230,7 @@ final class PreferencesWindow: NSWindowController, NSWindowDelegate {
     private func select(_ page: Page) {
         onEndRecording?()
         self.page = page
-        navigation.enumerated().forEach { $0.element.selected = $0.offset == page.rawValue }
+        navigation.forEach { $0.selected = $0.tag == page.rawValue }
         content.subviews.filter { $0 !== feedback }.forEach { $0.removeFromSuperview() }
         let header = ProductStyle.stack([
             ProductStyle.label(page.title, size: 27, weight: .semibold),
@@ -237,6 +243,7 @@ final class PreferencesWindow: NSWindowController, NSWindowDelegate {
         case .filters: body = filtersPage()
         case .privacy: body = privacyPage()
         case .about: body = aboutPage()
+        case .statistics: body = statisticsPage()
         }
         let stack = ProductStyle.stack([header, body], spacing: 28)
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -325,9 +332,170 @@ final class PreferencesWindow: NSWindowController, NSWindowDelegate {
                 divider(),
                 row("转入固定搜索", "松键模式下也不必一直按住修饰键。", control: ProductStyle.label("搜索快捷键 / 空格 / ⌘F", size: 12, weight: .medium))
             ], spacing: 14),
-            ProductStyle.label("⌘, 设置    ⌘1–5 设置页面    ⌘M 最小化设置    ⌘Q 退出", size: 12, color: .secondaryLabelColor),
+            ProductStyle.label("⌘, 设置    ⌘1–6 设置页面    ⌘M 最小化设置    ⌘Q 退出", size: 12, color: .secondaryLabelColor),
             ProductStyle.label("设置为 ⌘Tab 会接管系统应用切换。按住切换修饰键时，按 F 或空格，即可松开修饰键继续搜索。", size: 12, color: .secondaryLabelColor)
         ], spacing: 18))
+    }
+
+    private func statisticsPage() -> NSStackView {
+        func metric(_ title: String, value: NSTextField, size: CGFloat, help: String) -> NSStackView {
+            let label = ProductStyle.label(title, size: 12, color: .secondaryLabelColor)
+            value.font = .monospacedDigitSystemFont(ofSize: size, weight: .medium)
+            value.maximumNumberOfLines = 1
+            value.lineBreakMode = .byTruncatingTail
+            value.setAccessibilityLabel(title)
+            value.toolTip = help
+            label.toolTip = help
+            return ProductStyle.stack([label, value], spacing: 8)
+        }
+        let help = ProductButton("统计说明", kind: .quiet) { [weak self] in self?.showStatisticsHelp() }
+        help.font = .systemFont(ofSize: 12, weight: .medium)
+        help.setAccessibilityLabel("查看统计口径与自动返回说明")
+        let overviewTitle = ProductStyle.label("切换次数", size: 14, weight: .semibold)
+        overviewTitle.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let header = ProductStyle.stack([overviewTitle, help], vertical: false, spacing: 16)
+        statisticsValues[0].textColor = ProductStyle.accent
+        let primary = ProductStyle.stack([
+            metric("今日切换", value: statisticsValues[0], size: 34, help: "按本机日期统计成功的主动切换，不含自动返回。"),
+            metric("累计切换", value: statisticsValues[1], size: 34, help: "自开始记录或上次清空以来，成功的主动切换次数。")
+        ], vertical: false, spacing: 24)
+        primary.distribution = .fillEqually
+
+        func detail(_ title: String, value: NSTextField, caption: String, help: String) -> NSStackView {
+            value.font = .monospacedDigitSystemFont(ofSize: 20, weight: .medium)
+            value.setAccessibilityLabel(title)
+            value.toolTip = help
+            let label = ProductStyle.label(title, size: 13, weight: .medium)
+            label.toolTip = help
+            label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            let heading = ProductStyle.stack([label, value], vertical: false, spacing: 12)
+            let note = ProductStyle.label(caption, size: 11, color: .secondaryLabelColor)
+            note.toolTip = help
+            return fit(ProductStyle.stack([heading, note], spacing: 7))
+        }
+        let secondary = ProductStyle.stack([
+            detail("其中重开", value: statisticsReopens, caption: "已包含在切换次数内",
+                   help: "选择重开入口后，打开请求或主窗口聚焦确认成功的次数，是累计切换次数的一部分。"),
+            detail("自动返回", value: statisticsValues[2], caption: "⌘W 关闭后回到上一窗口",
+                   help: "关闭最后一个可见窗口后，窗序自动聚焦最近使用的其他可见窗口。仅成功交接计数，不计入主动切换次数或耗时。")
+        ], vertical: false, spacing: 24)
+        secondary.distribution = .fillEqually
+
+        let durationHelp = "从确认切换到收到结果，包含焦点校验；不代表画面绘制完成时间，不包含自动返回。"
+        let durations = ProductStyle.stack([
+            metric("平均", value: statisticsValues[3], size: 24, help: durationHelp),
+            metric("最近一次", value: statisticsValues[4], size: 24, help: durationHelp),
+            metric("最长", value: statisticsValues[5], size: 24, help: durationHelp)
+        ], vertical: false, spacing: 24)
+        durations.distribution = .fillEqually
+        let reset = ProductButton("清空统计", kind: .quiet) { [weak self] in self?.resetStatistics() }
+        statisticsSince.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let footer = ProductStyle.stack([statisticsSince, reset], vertical: false, spacing: 16)
+        refreshStatistics()
+        return fit(ProductStyle.stack([
+            card([header, primary, divider(), secondary], spacing: 20),
+            card([ProductStyle.label("处理耗时", size: 14, weight: .semibold), durations,
+                  ProductStyle.label("仅统计主动切换 · 包含焦点校验", size: 11, color: .secondaryLabelColor)], spacing: 18),
+            footer
+        ], spacing: 18))
+    }
+
+    private func showStatisticsHelp() {
+        guard let window, window.attachedSheet == nil else { return }
+        let sheet = ProductSheet(contentRect: NSRect(x: 0, y: 0, width: 520, height: 520),
+            styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
+        sheet.title = "统计说明"
+        sheet.titleVisibility = .hidden
+        sheet.titlebarAppearsTransparent = true
+        sheet.isReleasedWhenClosed = false
+        guard let root = sheet.contentView else { return }
+
+        func section(_ symbol: String, _ title: String, _ description: String) -> NSView {
+            let icon = ProductStyle.symbol(symbol, size: 18)
+            icon.widthAnchor.constraint(equalToConstant: 24).isActive = true
+            icon.heightAnchor.constraint(equalToConstant: 24).isActive = true
+            let text = ProductStyle.stack([
+                ProductStyle.label(title, size: 13, weight: .semibold),
+                ProductStyle.label(description, size: 12, color: .secondaryLabelColor)
+            ], spacing: 6)
+            let line = ProductStyle.stack([icon, text], vertical: false, spacing: 14)
+            line.alignment = .top
+            text.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            return line
+        }
+        let header = ProductStyle.stack([
+            ProductStyle.label("统计说明", size: 24, weight: .semibold),
+            ProductStyle.label("次数与耗时如何计算", size: 13, color: .secondaryLabelColor)
+        ], spacing: 8)
+        let details = card([
+            section("arrow.left.arrow.right", "切换次数", "主动选择窗口，聚焦或打开请求成功后计 1 次。取消和未确认不计入，重开次数已包含在累计次数中。"),
+            divider(),
+            section("arrow.uturn.backward", "自动返回", "⌘W 关闭最后一个可见窗口后，自动回到最近使用的其他可见窗口。仅成功交接计数，不计入主动切换次数或耗时。"),
+            divider(),
+            section("stopwatch", "处理耗时", "从确认切换到收到结果，包含焦点校验。重开以请求返回或主窗口确认成功为准，不代表画面绘制完成时间。")
+        ], spacing: 16)
+        let note = ProductStyle.label("还有可见窗口、关闭确认框或没有可用目标时，不触发自动返回。手动切换和系统自行交接不计入。", size: 11, color: .secondaryLabelColor)
+        let body = fit(ProductStyle.stack([header, details, note], spacing: 20))
+        let done = ProductButton("完成", kind: .primary) { [weak sheet] in
+            guard let sheet else { return }
+            sheet.sheetParent?.endSheet(sheet)
+        }
+        done.keyEquivalent = "\r"
+        done.keyEquivalentModifierMask = []
+        done.widthAnchor.constraint(equalToConstant: 88).isActive = true
+        sheet.defaultButtonCell = done.cell as? NSButtonCell
+        let privacy = ProductStyle.label("仅本机汇总，不保存操作明细", size: 11, color: .secondaryLabelColor)
+        privacy.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let footer = ProductStyle.stack([privacy, done], vertical: false, spacing: 16)
+        for view in [body, footer] { view.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(view) }
+        NSLayoutConstraint.activate([
+            body.topAnchor.constraint(equalTo: root.topAnchor, constant: 28),
+            body.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 28),
+            body.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -28),
+            body.bottomAnchor.constraint(lessThanOrEqualTo: footer.topAnchor, constant: -20),
+            footer.leadingAnchor.constraint(equalTo: body.leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: body.trailingAnchor),
+            footer.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -24)
+        ])
+        sheet.recalculateKeyViewLoop()
+        statisticsSheet = sheet
+        window.beginSheet(sheet) { [weak self, weak sheet] _ in
+            sheet?.orderOut(nil)
+            self?.statisticsSheet = nil
+        }
+        sheet.makeFirstResponder(done)
+    }
+
+    private func refreshStatistics() {
+        SwitchStatistics.shared.snapshot { [weak self] snapshot in
+            guard let self, self.page == .statistics else { return }
+            func count(_ value: Int) -> String {
+                NumberFormatter.localizedString(from: NSNumber(value: value), number: .decimal)
+            }
+            func duration(_ milliseconds: Double?) -> String {
+                guard let milliseconds else { return "—" }
+                return milliseconds < 1000 ? String(format: "%.1f ms", milliseconds) : String(format: "%.2f s", milliseconds / 1000)
+            }
+            let values = [count(snapshot.todaySwitches), count(snapshot.switches), count(snapshot.automaticReturns),
+                          duration(snapshot.averageMilliseconds), duration(snapshot.lastMilliseconds), duration(snapshot.longestMilliseconds)]
+            for (label, value) in zip(self.statisticsValues, values) { label.stringValue = value }
+            self.statisticsReopens.stringValue = count(snapshot.reopens)
+            let date = DateFormatter.localizedString(from: snapshot.since, dateStyle: .medium, timeStyle: .none)
+            self.statisticsSince.stringValue = "自 \(date) 起累计 · 仅保存在本机"
+        }
+    }
+
+    private func resetStatistics() {
+        guard let window else { return }
+        let alert = NSAlert()
+        alert.messageText = "清空所有使用统计？"
+        alert.informativeText = "切换次数与耗时记录将归零，其他设置不受影响。"
+        alert.addButton(withTitle: "清空统计")
+        alert.addButton(withTitle: "取消")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            SwitchStatistics.shared.reset { [weak self] in self?.refreshStatistics() }
+        }
     }
 
     private func filtersPage() -> NSStackView {
@@ -408,7 +576,7 @@ final class PreferencesWindow: NSWindowController, NSWindowDelegate {
             card([
                 privacyRow("rectangle.slash", "无需屏幕录制", "使用窗口名称与应用图标，不截取屏幕画面。"), divider(),
                 privacyRow("internaldrive", "数据保留在本机", "不上传窗口信息；诊断记录不包含窗口标题或聊天内容。"), divider(),
-                privacyRow("cursorarrow.click", "由你决定切换目标", "只有选择窗口后，窗序才会发出聚焦或打开请求。")
+                privacyRow("cursorarrow.click", "由操作触发焦点交接", "选择窗口或关闭最后一个可见窗口后，窗序按切换规则聚焦目标。")
             ])
         ], spacing: 18))
     }
@@ -443,5 +611,8 @@ final class PreferencesWindow: NSWindowController, NSWindowDelegate {
     @objc private func toggleEnabled() { onEnabledChange?(enabledSwitch.state == .on) }
     func windowDidBecomeKey(_ notification: Notification) { onFocused?() }
     func windowDidResignKey(_ notification: Notification) { onEndRecording?() }
-    func windowWillClose(_ notification: Notification) { onEndRecording?() }
+    func windowWillClose(_ notification: Notification) {
+        if let statisticsSheet { window?.endSheet(statisticsSheet) }
+        onEndRecording?()
+    }
 }

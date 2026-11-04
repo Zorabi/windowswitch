@@ -590,9 +590,11 @@ final class WindowCatalog {
     }
 
     func focus(_ item: WindowItem, requestedAt: TimeInterval = ProcessInfo.processInfo.systemUptime,
+               origin: WindowFocusOrigin = .switcher,
                onFronted: @escaping () -> Void = {}, completion: @escaping (String?) -> Void) {
         cancelPendingFocus()
-        let request = WindowFocusRequest(pid: item.pid, windowID: item.windowID, startedAt: requestedAt, diagnosticFile: item.policy.focusDiagnosticFile)
+        let request = WindowFocusRequest(pid: item.pid, windowID: item.windowID, startedAt: requestedAt,
+            diagnosticFile: item.policy.focusDiagnosticFile, origin: origin, isReopen: item.isApplicationEntry)
         activeFocusRequest = request
         guard let selectedElement = item.element else {
             if item.isPrimaryWindow {

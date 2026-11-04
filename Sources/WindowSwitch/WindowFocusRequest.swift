@@ -7,6 +7,8 @@ final class WindowFocusRequest {
     let pid: pid_t
     private var windowID: UInt32?
     let startedAt: TimeInterval
+    private let origin: WindowFocusOrigin
+    private let isReopen: Bool
     private let lock = NSLock()
     private var cancelled = false
     private var finished = false
@@ -16,11 +18,14 @@ final class WindowFocusRequest {
     // Accessed only on outputQueue; a late old request cannot replace newer evidence.
     private static var newestStarts: [String: TimeInterval] = [:]
 
-    init(pid: pid_t, windowID: UInt32?, startedAt: TimeInterval, diagnosticFile: String) {
+    init(pid: pid_t, windowID: UInt32?, startedAt: TimeInterval, diagnosticFile: String,
+         origin: WindowFocusOrigin, isReopen: Bool) {
         self.pid = pid
         self.windowID = windowID
         self.startedAt = startedAt
         self.diagnosticFile = diagnosticFile
+        self.origin = origin
+        self.isReopen = isReopen
         mark("main_received")
     }
 
@@ -71,12 +76,17 @@ final class WindowFocusRequest {
         lock.lock()
         guard !finished else { lock.unlock(); return }
         finished = true
+        let resolvedOutcome = cancelled ? "cancelled" : outcome
+        let milliseconds = age * 1000
         let snapshot: [String: Any] = [
             "recordedAt": ISO8601DateFormatter().string(from: Date()),
-            "pid": pid, "windowID": windowID ?? 0, "outcome": outcome,
-            "elapsedMs": age * 1000, "stages": stages
+            "pid": pid, "windowID": windowID ?? 0, "outcome": resolvedOutcome,
+            "elapsedMs": milliseconds, "stages": stages, "origin": origin.rawValue,
+            "isReopen": isReopen
         ]
         lock.unlock()
+        SwitchStatistics.shared.record(origin: origin, isReopen: isReopen,
+                                       outcome: resolvedOutcome, milliseconds: milliseconds)
         let start = startedAt
         let filename = diagnosticFile
         Self.outputQueue.async {

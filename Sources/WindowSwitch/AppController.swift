@@ -42,6 +42,7 @@ final class AppController: NSObject {
 
     func start() {
         PreferencesWindow.applyAppearance()
+        _ = SwitchStatistics.shared
         if let icon = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"), let image = NSImage(contentsOf: icon) {
             NSApp.applicationIconImage = image
         }
@@ -266,7 +267,7 @@ final class AppController: NSObject {
             return
         }
         closeWindowHandoff?.targetPID = target.pid
-        catalog.focus(target, onFronted: { [weak self] in
+        catalog.focus(target, origin: .automaticReturn, onFronted: { [weak self] in
             self?.resumeSwitchingAfterClose(id)
         }) { [weak self] _ in
             guard self?.closeWindowHandoff?.id == id else { return }

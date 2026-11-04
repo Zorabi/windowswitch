@@ -42,6 +42,13 @@ enum ProductStyle {
     }
 }
 
+/// A document-modal sheet with the native Escape dismissal path.
+final class ProductSheet: NSPanel {
+    override func cancelOperation(_ sender: Any?) {
+        if let sheetParent { sheetParent.endSheet(self) }
+    }
+}
+
 final class SurfaceView: NSView {
     var fill: NSColor = .controlBackgroundColor
     var radius: CGFloat = 14
