@@ -4,7 +4,7 @@ cd "$(dirname "$0")/.."
 python3 scripts/setup-signing.py
 swift build -c release
 bin_dir="$(swift build -c release --show-bin-path)"
-app="build/WindowSwitch.app"
+app="build/.Products.noindex/窗序.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp Config/Info.plist "$app/Contents/Info.plist"
 cp LICENSE "$app/Contents/Resources/LICENSE"
@@ -31,17 +31,35 @@ pin.write_text(requirement+'\n')
 print('Stable application identity verified.')
 PY
 if [[ "${1:-}" == "--install" ]]; then
-    pkill -TERM -f '^/Applications/WindowSwitch[.]app/Contents/MacOS/WindowSwitch$' || true
+    installed="/Applications/窗序.app"
+    legacy="/Applications/WindowSwitch.app"
+    lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+    process_pattern='^/Applications/(WindowSwitch|窗序)[.]app/Contents/MacOS/WindowSwitch$'
+    requirement="$(sed -n 's/^designated => //p' build/designated-requirement.txt)"
+    for existing in "$installed" "$legacy"; do
+        if [[ -e "$existing" || -L "$existing" ]]; then
+            codesign --verify --strict -R "=$requirement" "$existing"
+        fi
+    done
+    if [[ -e "$installed" && -e "$legacy" ]]; then
+        echo 'Both application paths exist; installation stopped to avoid replacing either copy.' >&2
+        exit 1
+    fi
+    pkill -TERM -f "$process_pattern" || true
     for attempt in {1..30}; do
-        if ! pgrep -f '^/Applications/WindowSwitch[.]app/Contents/MacOS/WindowSwitch$' > /dev/null; then break; fi
+        if ! pgrep -f "$process_pattern" > /dev/null; then break; fi
         sleep 0.1
     done
-    if pgrep -f '^/Applications/WindowSwitch[.]app/Contents/MacOS/WindowSwitch$' > /dev/null; then
+    if pgrep -f "$process_pattern" > /dev/null; then
         echo 'WindowSwitch has not exited; installation stopped.' >&2
         exit 1
     fi
-    ditto "$app" /Applications/WindowSwitch.app
-    codesign --verify --strict /Applications/WindowSwitch.app
-    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/WindowSwitch.app
-    open -n /Applications/WindowSwitch.app
+    if [[ -d "$legacy" ]]; then
+        "$lsregister" -u "$legacy"
+        mv "$legacy" "$installed"
+    fi
+    ditto "$app" "$installed"
+    codesign --verify --strict "$installed"
+    "$lsregister" -f "$installed"
+    open -n "$installed"
 fi
