@@ -44,6 +44,7 @@ final class KeyboardTap {
     enum Action { case next(Bool), commit, cancel, openSearch, search(NSEvent) }
     var onAction: ((Action) -> Void)?
     var onRecord: ((Int64, CGEventFlags, String?) -> Void)?
+    var onCloseShortcut: (() -> Void)?
     var shortcut = SwitchShortcut.load()
     var searchShortcut = SwitchShortcut.load(prefix: "search", fallback: .searchStandard)
     var commitOnRelease = UserDefaults.standard.bool(forKey: "commitOnRelease")
@@ -150,6 +151,11 @@ final class KeyboardTap {
                     }
                 }
             }
+        }
+        if !panelPresented, !switching, !enteringText, type == .keyDown, code == 13,
+           flags == .maskCommand, event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+            // Observe Cmd+W without consuming or rewriting the application's event.
+            onCloseShortcut?()
         }
         return Unmanaged.passUnretained(event)
     }

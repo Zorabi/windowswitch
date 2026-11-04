@@ -30,6 +30,15 @@ final class AppController: NSObject {
     private var scanInFlight = false
     private var lastScan = Date.distantPast
     private var scanWaiters: [([WindowItem]) -> Void] = []
+    private struct CloseWindowHandoff {
+        let id = UUID()
+        let source: NSRunningApplication
+        let windowID: CGWindowID
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        var targetPID: pid_t?
+        var deferredActions: [KeyboardTap.Action] = []
+    }
+    private var closeWindowHandoff: CloseWindowHandoff?
 
     func start() {
         PreferencesWindow.applyAppearance()
@@ -50,6 +59,7 @@ final class AppController: NSObject {
                 self.handle(action)
             }
         }
+        keyboard.onCloseShortcut = { [weak self] in self?.prepareCloseWindowHandoff() }
         switcher.onWillActivate = { [weak self] in self?.preferences?.suspendIfInBackground() }
         switcher.onDidHide = { [weak self] in self?.preferences?.restoreAfterSwitcher() }
         switcher.onSelect = { [weak self] item in self?.focus(item) }
@@ -63,6 +73,11 @@ final class AppController: NSObject {
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] _ in
             guard let self, self.trusted else { return }
+            if let handoff = self.closeWindowHandoff,
+               let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+               pid != handoff.source.processIdentifier, pid != handoff.targetPID {
+                self.cancelCloseWindowHandoff()
+            }
             self.recordForegroundWindowUse()
             self.catalog.noteFocusedWindow()
             if self.session == nil {
@@ -79,6 +94,7 @@ final class AppController: NSObject {
     }
 
     func stop() {
+        cancelCloseWindowHandoff()
         catalog.cancelPendingFocus()
         keyboard.stop()
         timer?.invalidate()
@@ -107,6 +123,23 @@ final class AppController: NSObject {
 
     private func handle(_ action: KeyboardTap.Action) {
         guard trusted, !paused, recorder == nil else { return }
+        if case .next = action, let handoff = closeWindowHandoff, handoff.targetPID == nil {
+            returnFocusAfterClose(handoff.id)
+        }
+        if closeWindowHandoff?.targetPID != nil {
+            switch action {
+            case .next:
+                closeWindowHandoff?.deferredActions.append(action)
+                return
+            case .commit, .search:
+                if closeWindowHandoff?.deferredActions.isEmpty == false {
+                    closeWindowHandoff?.deferredActions.append(action)
+                    return
+                }
+            default: break
+            }
+        }
+        cancelCloseWindowHandoff()
         switch action {
         case .next(let reverse):
             if session != nil {
@@ -160,6 +193,7 @@ final class AppController: NSObject {
     }
 
     private func cancel(restoreFocus: Bool = true, keepPanelForHandoff: Bool = false) {
+        cancelCloseWindowHandoff()
         catalog.cancelPendingFocus()
         session = nil
         sessionSourcePID = nil
@@ -170,6 +204,95 @@ final class AppController: NSObject {
         searchPinned = false
         keyboard.finish()
         if !keepPanelForHandoff { switcher.hide(restoreFocus: restoreFocus) }
+    }
+
+    private func cancelCloseWindowHandoff() {
+        if closeWindowHandoff?.targetPID != nil { catalog.cancelPendingFocus() }
+        closeWindowHandoff = nil
+    }
+
+    private func prepareCloseWindowHandoff() {
+        guard trusted, !paused, recorder == nil, session == nil, !switcher.panel.isVisible,
+              let app = NSWorkspace.shared.frontmostApplication,
+              app.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
+        if let bundleID = app.bundleIdentifier, ApplicationFilters.shared.mode(for: bundleID) == .hidden { return }
+        let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        let windows = rows.filter {
+            ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == app.processIdentifier
+        }
+        guard let windowID = visibleWindowIDs(in: windows).first else { return }
+        cancelCloseWindowHandoff()
+        let handoff = CloseWindowHandoff(source: app, windowID: windowID)
+        closeWindowHandoff = handoff
+        // Give the original key event time to reach the application. Poll only
+        // this bounded close request; the normal catalog scan interval is unchanged.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
+            self?.returnFocusAfterClose(handoff.id)
+        }
+    }
+
+    private func returnFocusAfterClose(_ id: UUID) {
+        guard let handoff = closeWindowHandoff, handoff.id == id, handoff.targetPID == nil else { return }
+        guard trusted, !paused, recorder == nil, session == nil, !switcher.panel.isVisible,
+              ProcessInfo.processInfo.systemUptime - handoff.startedAt < 0.6,
+              !handoff.source.isTerminated,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == handoff.source.processIdentifier else {
+            cancelCloseWindowHandoff()
+            return
+        }
+        let rows = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        let remaining = rows.filter { row in
+            (row[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == handoff.source.processIdentifier
+        }
+        // Some applications keep closed windows registered with WindowServer.
+        // Only visible windows block handoff, including uncached confirmations.
+        let remainingIDs = visibleWindowIDs(in: remaining)
+        let originalStillVisible = remainingIDs.contains(handoff.windowID)
+        let hasOtherVisibleWindow = remainingIDs.contains { $0 != handoff.windowID }
+        if originalStillVisible || hasOtherVisibleWindow {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
+                self?.returnFocusAfterClose(id)
+            }
+            return
+        }
+        let visibleIDs = Set(visibleWindowIDs(in: rows))
+        let items = immediateWindowItems(applyFilters: false)
+        cachedItems = items
+        guard let target = items.first(where: {
+            $0.pid != handoff.source.processIdentifier && !$0.isApplicationEntry && !$0.isLocalSettings &&
+            !$0.minimized && !$0.application.isHidden &&
+            $0.windowID.map(visibleIDs.contains) == true && ApplicationFilters.shared.allows($0)
+        }) else {
+            cancelCloseWindowHandoff()
+            return
+        }
+        closeWindowHandoff?.targetPID = target.pid
+        catalog.focus(target, onFronted: { [weak self] in
+            self?.resumeSwitchingAfterClose(id)
+        }) { [weak self] _ in
+            guard self?.closeWindowHandoff?.id == id else { return }
+            self?.resumeSwitchingAfterClose(id)
+            guard self?.closeWindowHandoff?.id == id else { return }
+            self?.closeWindowHandoff = nil
+        }
+    }
+
+    private func visibleWindowIDs(in rows: [[String: Any]]) -> [CGWindowID] {
+        rows.compactMap { row in
+            guard (row[kCGWindowIsOnscreen as String] as? Bool) == true,
+                  (row[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1 > 0.05,
+                  let bounds = row[kCGWindowBounds as String] as? [String: Any],
+                  let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+                  rect.width >= 70, rect.height >= 70 else { return nil }
+            return (row[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+        }
+    }
+
+    private func resumeSwitchingAfterClose(_ id: UUID) {
+        guard let handoff = closeWindowHandoff, handoff.id == id,
+              !handoff.deferredActions.isEmpty else { return }
+        closeWindowHandoff = nil
+        handoff.deferredActions.forEach { handle($0) }
     }
 
     private func localSettingsItems() -> [WindowItem] {
