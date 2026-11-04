@@ -259,7 +259,7 @@ final class AppController: NSObject {
         let items = immediateWindowItems(applyFilters: false)
         cachedItems = items
         guard let target = items.first(where: {
-            $0.pid != handoff.source.processIdentifier && !$0.isApplicationEntry && !$0.isLocalSettings &&
+            $0.pid != handoff.source.processIdentifier && $0.canRepresentForegroundWindow &&
             !$0.minimized && !$0.application.isHidden &&
             $0.windowID.map(visibleIDs.contains) == true && ApplicationFilters.shared.allows($0)
         }) else {
@@ -267,13 +267,27 @@ final class AppController: NSObject {
             return
         }
         closeWindowHandoff?.targetPID = target.pid
-        catalog.focus(target, origin: .automaticReturn, onFronted: { [weak self] in
-            self?.resumeSwitchingAfterClose(id)
-        }) { [weak self] _ in
+        let finish = { [weak self] in
             guard self?.closeWindowHandoff?.id == id else { return }
             self?.resumeSwitchingAfterClose(id)
             guard self?.closeWindowHandoff?.id == id else { return }
             self?.closeWindowHandoff = nil
+        }
+        if target.isLocalSettings, let preferences {
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            preferences.present()
+            DispatchQueue.main.async { [weak self, weak preferences] in
+                guard self?.closeWindowHandoff?.id == id else { return }
+                if preferences?.window?.isKeyWindow == true, NSApp.isActive {
+                    SwitchStatistics.shared.record(origin: .automaticReturn, isReopen: false,
+                        outcome: "confirmed", milliseconds: (ProcessInfo.processInfo.systemUptime - startedAt) * 1000)
+                }
+                finish()
+            }
+        } else {
+            catalog.focus(target, origin: .automaticReturn, onFronted: { [weak self] in
+                self?.resumeSwitchingAfterClose(id)
+            }) { _ in finish() }
         }
     }
 
@@ -584,8 +598,18 @@ final class AppController: NSObject {
     }
 
     @objc func closeCurrentWindow() {
-        if session != nil { cancel() }
-        else { preferences?.window?.performClose(nil) }
+        guard NSApp.isActive,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == NSRunningApplication.current.processIdentifier,
+              let keyWindow = NSApp.keyWindow else { return }
+        if keyWindow === switcher.panel, session != nil {
+            cancel()
+        } else if let settings = preferences?.window {
+            if let sheet = settings.attachedSheet, keyWindow === sheet {
+                settings.endSheet(sheet, returnCode: .cancel)
+            } else if keyWindow === settings, settings.attachedSheet == nil {
+                settings.performClose(nil)
+            }
+        }
     }
 
     @objc func showSettingsSection(_ sender: NSMenuItem) {

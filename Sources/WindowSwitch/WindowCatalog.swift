@@ -22,7 +22,7 @@ struct WindowItem {
     }
     var isApplicationEntry: Bool { element == nil }
     var isPrimaryWindow: Bool { policy.isPrimaryWindow(title: title, isApplicationEntry: isApplicationEntry) }
-    var canRepresentForegroundWindow: Bool { !isApplicationEntry }
+    var canRepresentForegroundWindow: Bool { !isApplicationEntry || isLocalSettings }
 
     var applicationReopenEntry: WindowItem {
         return WindowItem(key: "app:\(pid)", pid: pid, windowID: nil, application: application,
