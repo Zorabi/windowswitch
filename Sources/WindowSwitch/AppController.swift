@@ -310,9 +310,17 @@ final class AppController: NSObject {
             }
             let frontID = (firstKnown?[kCGWindowNumber as String] as? NSNumber)?.uint32Value
             let observedIndex = observedFocus[foregroundPID].flatMap { focus in
-                items.firstIndex { $0.pid == foregroundPID && $0.key == focus.key }
+                items.firstIndex {
+                    $0.pid == foregroundPID && $0.key == focus.key &&
+                    !($0.isWeChatMain && $0.element == nil)
+                }
             }
-            let index = observedIndex ?? items.firstIndex(where: { $0.pid == foregroundPID && (frontID == nil || $0.windowID == frontID) })
+            // WeChat can remain the foreground process briefly after Cmd+W.
+            // Its reopen action is not a focused window and keeps its MRU rank.
+            let index = observedIndex ?? items.firstIndex(where: {
+                $0.pid == foregroundPID && !($0.isWeChatMain && $0.element == nil) &&
+                (frontID == nil || $0.windowID == frontID)
+            })
             if let index { items.insert(items.remove(at: index), at: 0) }
         }
         return applyFilters ? items.filter { ApplicationFilters.shared.allows($0) } : items

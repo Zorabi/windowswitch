@@ -292,12 +292,22 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
 
     func updateItems(_ items: [WindowItem]) {
         guard panel.isVisible, !closing else { return }
-        let selectedKey = selected?.key
+        var selectedKey = selected?.key
         let refreshed = Dictionary(items.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
-        let existingKeys = Set(all.map(\.key))
+        var usedKeys = Set<String>()
         // Refresh metadata and remove closed entries without changing this
-        // session's navigation order. Newly discovered entries go at the end.
-        all = all.compactMap { refreshed[$0.key] } + items.filter { !existingKeys.contains($0.key) }
+        // session's navigation order. A closed WeChat main window and its reopen
+        // entry occupy the same slot; distinct live windows still use exact IDs.
+        let existing = all.compactMap { old -> WindowItem? in
+            let replacement = refreshed[old.key] ?? items.first {
+                old.isWeChatMain && $0.isWeChatMain && old.pid == $0.pid &&
+                (old.element == nil || $0.element == nil) && !usedKeys.contains($0.key)
+            }
+            guard let replacement, usedKeys.insert(replacement.key).inserted else { return nil }
+            if selectedKey == old.key { selectedKey = replacement.key }
+            return replacement
+        }
+        all = existing + items.filter { !usedKeys.contains($0.key) }
         applyFilter(index: max(0, table.selectedRow), preserving: selectedKey)
     }
 
