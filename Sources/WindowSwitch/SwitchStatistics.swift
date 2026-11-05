@@ -17,6 +17,12 @@ final class SwitchStatistics {
         var switches = 0
         var reopens = 0
         var automaticReturns = 0
+        private var storedAutomaticReturnFailures: Int?
+        var automaticReturnFailures: Int { storedAutomaticReturnFailures ?? 0 }
+
+        mutating func recordAutomaticReturnFailure() {
+            storedAutomaticReturnFailures = automaticReturnFailures + 1
+        }
         var totalMilliseconds: Double = 0
         var lastMilliseconds: Double?
         var longestMilliseconds: Double?
@@ -43,8 +49,9 @@ final class SwitchStatistics {
     }
 
     func record(origin: WindowFocusOrigin, isReopen: Bool, outcome: String, milliseconds: Double) {
-        guard outcome == "confirmed" || outcome == "application_opened",
-              milliseconds.isFinite, milliseconds >= 0 else { return }
+        let succeeded = outcome == "confirmed" || outcome == "application_opened"
+        let failedReturn = origin == .automaticReturn && outcome != "cancelled" && outcome != "foreground_changed"
+        guard (succeeded || failedReturn), milliseconds.isFinite, milliseconds >= 0 else { return }
         let finishedAt = Date()
         queue.async { [self] in
             state.updateDay(Date())
@@ -57,7 +64,8 @@ final class SwitchStatistics {
                 state.lastMilliseconds = milliseconds
                 state.longestMilliseconds = max(state.longestMilliseconds ?? 0, milliseconds)
             case .automaticReturn:
-                state.automaticReturns += 1
+                if succeeded { state.automaticReturns += 1 }
+                else { state.recordAutomaticReturnFailure() }
             }
             persist()
         }

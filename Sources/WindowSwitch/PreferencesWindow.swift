@@ -51,6 +51,7 @@ final class PreferencesWindow: NSWindowController, NSWindowDelegate {
     private var commitOnRelease = false
     private var suspendedForSwitcher = false
     private let statisticsValues = (0..<6).map { _ in ProductStyle.label("—", size: 25, weight: .medium) }
+    private let statisticsReturnFailures = ProductStyle.label("0", size: 14, weight: .medium)
     private let statisticsReopens = ProductStyle.label("0", size: 14, weight: .medium)
     private let statisticsSince = ProductStyle.label("", size: 11, color: .secondaryLabelColor)
     private var statisticsSheet: ProductSheet?
@@ -376,8 +377,10 @@ final class PreferencesWindow: NSWindowController, NSWindowDelegate {
         let secondary = ProductStyle.stack([
             detail("其中重开", value: statisticsReopens, caption: "已包含在切换次数内",
                    help: "选择重开入口后，打开请求或主窗口聚焦确认成功的次数，是累计切换次数的一部分。"),
-            detail("自动返回", value: statisticsValues[2], caption: "⌘W 关闭后回到上一窗口",
-                   help: "关闭最后一个可见窗口后，窗序自动聚焦最近使用的其他可见窗口。仅成功交接计数，不计入主动切换次数或耗时。")
+            detail("自动返回成功", value: statisticsValues[2], caption: "⌘W 关闭后回到上一窗口",
+                   help: "关闭最后一个可见窗口后，窗序自动聚焦最近使用的其他可见窗口。仅成功交接计数，不计入主动切换次数或耗时。"),
+            detail("自动返回失败", value: statisticsReturnFailures, caption: "已尝试，未确认成功",
+                   help: "已选定目标并发起自动返回，但聚焦失败或未获确认。没有可用目标、取消或主动切走不计入。")
         ], vertical: false, spacing: 24)
         secondary.distribution = .fillEqually
 
@@ -430,7 +433,7 @@ final class PreferencesWindow: NSWindowController, NSWindowDelegate {
         let details = card([
             section("arrow.left.arrow.right", "切换次数", "主动选择窗口，聚焦或打开请求成功后计 1 次。取消和未确认不计入，重开次数已包含在累计次数中。"),
             divider(),
-            section("arrow.uturn.backward", "自动返回", "⌘W 关闭最后一个可见窗口后，自动回到最近使用的其他可见窗口。仅成功交接计数，不计入主动切换次数或耗时。"),
+            section("arrow.uturn.backward", "自动返回", "⌘W 关闭最后一个可见窗口后，自动回到最近使用的其他可见窗口。成功与失败分别计数。失败指已发起交接但未成功或未获确认；取消不计入。"),
             divider(),
             section("stopwatch", "处理耗时", "从确认切换到收到结果，包含焦点校验。重开以请求返回或主窗口确认成功为准，不代表画面绘制完成时间。")
         ], spacing: 16)
@@ -480,6 +483,7 @@ final class PreferencesWindow: NSWindowController, NSWindowDelegate {
                           duration(snapshot.averageMilliseconds), duration(snapshot.lastMilliseconds), duration(snapshot.longestMilliseconds)]
             for (label, value) in zip(self.statisticsValues, values) { label.stringValue = value }
             self.statisticsReopens.stringValue = count(snapshot.reopens)
+            self.statisticsReturnFailures.stringValue = count(snapshot.automaticReturnFailures)
             let date = DateFormatter.localizedString(from: snapshot.since, dateStyle: .medium, timeStyle: .none)
             self.statisticsSince.stringValue = "自 \(date) 起累计 · 仅保存在本机"
         }

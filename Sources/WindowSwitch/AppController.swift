@@ -278,10 +278,10 @@ final class AppController: NSObject {
             preferences.present()
             DispatchQueue.main.async { [weak self, weak preferences] in
                 guard self?.closeWindowHandoff?.id == id else { return }
-                if preferences?.window?.isKeyWindow == true, NSApp.isActive {
-                    SwitchStatistics.shared.record(origin: .automaticReturn, isReopen: false,
-                        outcome: "confirmed", milliseconds: (ProcessInfo.processInfo.systemUptime - startedAt) * 1000)
-                }
+                let confirmed = preferences?.window?.isKeyWindow == true && NSApp.isActive
+                SwitchStatistics.shared.record(origin: .automaticReturn, isReopen: false,
+                    outcome: confirmed ? "confirmed" : "local_settings_unconfirmed",
+                    milliseconds: (ProcessInfo.processInfo.systemUptime - startedAt) * 1000)
                 finish()
             }
         } else {
