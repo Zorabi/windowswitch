@@ -443,9 +443,9 @@ final class AppController: NSObject {
         if let settings, seen.insert(settings.key).inserted { items.append(settings) }
         items = items.enumerated().sorted { left, right in
             let leftDate = displayRecency.date(key: left.element.key, pid: left.element.pid,
-                isApplication: left.element.isApplicationEntry, prefersPrimary: left.element.isPrimaryWindow)
+                isApplication: left.element.isApplicationEntry, prefersPrimary: left.element.isPrimaryWindow, observedAt: left.element.lastUsedAt)
             let rightDate = displayRecency.date(key: right.element.key, pid: right.element.pid,
-                isApplication: right.element.isApplicationEntry, prefersPrimary: right.element.isPrimaryWindow)
+                isApplication: right.element.isApplicationEntry, prefersPrimary: right.element.isPrimaryWindow, observedAt: right.element.lastUsedAt)
             return leftDate == rightDate ? left.offset < right.offset : leftDate > rightDate
         }.map(\.element)
         let foregroundPID = switcher.panel.isVisible ? sessionSourcePID : NSWorkspace.shared.frontmostApplication?.processIdentifier

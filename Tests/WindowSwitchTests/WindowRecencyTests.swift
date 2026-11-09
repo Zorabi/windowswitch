@@ -4,6 +4,16 @@ import XCTest
 @testable import WindowSwitch
 
 final class WindowRecencyTests: XCTestCase {
+    func testCatalogObservationSurvivesMissingOrOlderDisplayHistory() {
+        var history = WindowRecency()
+        let recent = Date(timeIntervalSince1970: 200)
+        XCTAssertEqual(history.date(key: "boardly", pid: 1, isApplication: false, prefersPrimary: false, observedAt: recent), recent)
+        history.recordWindow(key: "boardly", pid: 1, isPrimary: false, at: recent.addingTimeInterval(-10))
+        XCTAssertEqual(history.date(key: "boardly", pid: 1, isApplication: false, prefersPrimary: false, observedAt: recent), recent)
+        history.recordWindow(key: "boardly", pid: 1, isPrimary: false, at: recent.addingTimeInterval(10))
+        XCTAssertEqual(history.date(key: "boardly", pid: 1, isApplication: false, prefersPrimary: false, observedAt: recent), recent.addingTimeInterval(10))
+    }
+
     func testReopenEntryInheritsClosedMainWindowPosition() {
         var history = WindowRecency()
         let mainDate = Date(timeIntervalSince1970: 100)

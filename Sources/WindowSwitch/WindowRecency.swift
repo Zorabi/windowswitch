@@ -18,7 +18,11 @@ struct WindowRecency {
         if isPrimary { primaryWindows[pid] = max(primaryWindows[pid] ?? .distantPast, date) }
     }
 
-    func date(key: String, pid: pid_t, isApplication: Bool, prefersPrimary: Bool) -> Date {
+    func date(key: String, pid: pid_t, isApplication: Bool, prefersPrimary: Bool, observedAt: Date = .distantPast) -> Date {
+        max(observedAt, recordedDate(key: key, pid: pid, isApplication: isApplication, prefersPrimary: prefersPrimary))
+    }
+
+    private func recordedDate(key: String, pid: pid_t, isApplication: Bool, prefersPrimary: Bool) -> Date {
         if prefersPrimary, let date = primaryWindows[pid] { return date }
         if isApplication { return applications[pid] ?? .distantPast }
         return windows[key] ?? .distantPast

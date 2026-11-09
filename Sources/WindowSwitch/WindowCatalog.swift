@@ -16,6 +16,7 @@ struct WindowItem {
     let minimized: Bool
     let size: CGSize
     var isLocalSettingsReopen = false
+    var lastUsedAt = Date.distantPast
 
     var isLocalSettings: Bool { key == "local:settings" }
     var policy: ApplicationWindowPolicy {
@@ -27,7 +28,7 @@ struct WindowItem {
 
     var applicationReopenEntry: WindowItem {
         return WindowItem(key: "app:\(pid)", pid: pid, windowID: nil, application: application,
-            element: nil, appName: appName, title: appName, minimized: false, size: .zero)
+            element: nil, appName: appName, title: appName, minimized: false, size: .zero, lastUsedAt: lastUsedAt)
     }
 
     func canReplaceInSwitcher(_ old: WindowItem) -> Bool {
@@ -321,9 +322,14 @@ final class WindowCatalog {
             }
             let liveKeys = Set(items.map(\.key))
             recency.retain(windowKeys: liveKeys, pids: livePIDs)
+            for index in items.indices {
+                let item = items[index]
+                items[index].lastUsedAt = recency.date(key: item.key, pid: item.pid,
+                    isApplication: item.isApplicationEntry, prefersPrimary: item.isPrimaryWindow)
+            }
             items.sort { left, right in
-                let leftDate = recency.date(key: left.key, pid: left.pid, isApplication: left.isApplicationEntry, prefersPrimary: left.isPrimaryWindow)
-                let rightDate = recency.date(key: right.key, pid: right.pid, isApplication: right.isApplicationEntry, prefersPrimary: right.isPrimaryWindow)
+                let leftDate = left.lastUsedAt
+                let rightDate = right.lastUsedAt
                 if leftDate != rightDate { return leftDate > rightDate }
                 let leftOrder = left.windowID.flatMap { order[$0] } ?? Int.max
                 let rightOrder = right.windowID.flatMap { order[$0] } ?? Int.max
