@@ -55,6 +55,7 @@ final class KeyboardTap {
     private var searchPinned = false
     var panelPresented = false
     private var swallowFindKeyUp = false
+    private(set) var isCloseKeyHeld = false
 
     func start() -> Bool {
         if let tap { return CGEvent.tapIsEnabled(tap: tap) }
@@ -80,6 +81,7 @@ final class KeyboardTap {
         if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
         tap = nil
         source = nil
+        isCloseKeyHeld = false
         switching = false
         enteringText = false
         searchPinned = false
@@ -94,6 +96,7 @@ final class KeyboardTap {
             return Unmanaged.passUnretained(event)
         }
         let code = event.getIntegerValueField(.keyboardEventKeycode)
+        if type == .keyUp, code == 13 { isCloseKeyHeld = false }
         if type == .keyDown, let onRecord {
             onRecord(code, event.flags, NSEvent(cgEvent: event)?.charactersIgnoringModifiers)
             return nil
@@ -155,6 +158,7 @@ final class KeyboardTap {
         if !panelPresented, !switching, !enteringText, type == .keyDown, code == 13,
            flags == .maskCommand, event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
             // Observe Cmd+W without consuming or rewriting the application's event.
+            isCloseKeyHeld = true
             onCloseShortcut?()
         }
         return Unmanaged.passUnretained(event)

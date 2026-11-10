@@ -249,7 +249,9 @@ final class AppController: NSObject {
         let remainingIDs = visibleWindowIDs(in: remaining)
         let originalStillVisible = remainingIDs.contains(handoff.windowID)
         let hasOtherVisibleWindow = remainingIDs.contains { $0 != handoff.windowID }
-        if originalStillVisible || hasOtherVisibleWindow {
+        // Do not move held Cmd+W repeats into the next application. The bounded
+        // handoff expires normally if the user keeps holding W.
+        if keyboard.isCloseKeyHeld || originalStillVisible || hasOtherVisibleWindow {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
                 self?.returnFocusAfterClose(id)
             }

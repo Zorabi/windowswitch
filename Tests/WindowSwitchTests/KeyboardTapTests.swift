@@ -20,6 +20,41 @@ final class KeyboardTapTests: XCTestCase {
         return event
     }
 
+    func testCloseShortcutWaitsForWReleaseWhilePassingOriginalEventsThrough() {
+        let tap = KeyboardTap()
+        tap.shortcut = .standard
+        tap.searchShortcut = .searchStandard
+        var closes = 0
+        tap.onCloseShortcut = {
+            XCTAssertTrue(tap.isCloseKeyHeld)
+            closes += 1
+        }
+        let down = event(13, .maskCommand)
+        XCTAssertTrue(tap.receive(.keyDown, down)?.takeUnretainedValue() === down)
+        XCTAssertTrue(tap.isCloseKeyHeld)
+        let repeated = event(13, .maskCommand)
+        repeated.setIntegerValueField(.keyboardEventAutorepeat, value: 1)
+        XCTAssertTrue(tap.receive(.keyDown, repeated)?.takeUnretainedValue() === repeated)
+        XCTAssertEqual(closes, 1)
+        XCTAssertTrue(tap.isCloseKeyHeld)
+        _ = tap.receive(.flagsChanged, event(55, []))
+        XCTAssertTrue(tap.isCloseKeyHeld)
+        let up = event(13, [])
+        XCTAssertTrue(tap.receive(.keyUp, up)?.takeUnretainedValue() === up)
+        XCTAssertFalse(tap.isCloseKeyHeld)
+        XCTAssertEqual(closes, 1)
+    }
+
+    func testStoppingClearsHeldCloseKey() {
+        let tap = KeyboardTap()
+        tap.shortcut = .standard
+        tap.searchShortcut = .searchStandard
+        _ = tap.receive(.keyDown, event(13, .maskCommand))
+        XCTAssertTrue(tap.isCloseKeyHeld)
+        tap.stop()
+        XCTAssertFalse(tap.isCloseKeyHeld)
+    }
+
     func testDefaultDoesNotInterceptSystemCommandTab() {
         let tap = KeyboardTap()
         tap.shortcut = .standard
