@@ -57,6 +57,13 @@ struct ApplicationWindowPolicy {
         !primaryWindowTitles.isEmpty && (isApplicationEntry || primaryWindowTitles.contains(title))
     }
 
+    func retainsUnreportedWindow(isPrimary: Bool, isMinimized: Bool, isApplicationHidden: Bool,
+                                 isOnscreen: Bool, hasReliableWindowList: Bool) -> Bool {
+        // A closed WeChat main window can keep its CGWindowID after disappearing
+        // from AX. Live minimized/hidden windows must remain switchable.
+        !isPrimary || isMinimized || isApplicationHidden || isOnscreen || !hasReliableWindowList
+    }
+
     func shouldIncludeApplicationEntry(isRegular: Bool, windowTitles: [String]) -> Bool {
         guard isRegular, allowsApplicationEntry else { return false }
         if primaryWindowTitles.isEmpty { return windowTitles.isEmpty }

@@ -193,6 +193,12 @@ final class WindowCatalog {
         }
     }
 
+    func noteWindowUse(_ item: WindowItem, at date: Date) {
+        queue.async { [self] in
+            recency.recordWindow(key: item.key, pid: item.pid, isPrimary: item.isPrimaryWindow, at: date)
+        }
+    }
+
     func noteLocalWindowUse(key: String, pid: pid_t) {
         let now = Date()
         queue.async { [self] in recency.recordWindow(key: key, pid: pid, isPrimary: false, at: now) }
@@ -223,12 +229,16 @@ final class WindowCatalog {
                 var raw: CFTypeRef?
                 let readResult = AXUIElementCopyAttributeValue(source, kAXWindowsAttribute as CFString, &raw)
                 let reportedWindows = raw as? [AXUIElement] ?? []
+                var reportedKeys = Set(reportedWindows.map { AXRead.key(pid: app.processIdentifier, element: $0) })
                 var windows = reportedWindows
                 if policy.discoversAdditionalWindows {
                     // Some applications expose only their current window through AXWindows.
                     // Other top-level references still identify separate windows.
                     for attribute in [kAXFocusedWindowAttribute, kAXMainWindowAttribute] {
-                        if let window = AXRead.element(source, attribute) { windows.append(window) }
+                        if let window = AXRead.element(source, attribute) {
+                            windows.append(window)
+                            reportedKeys.insert(AXRead.key(pid: app.processIdentifier, element: window))
+                        }
                     }
                     let children = AXRead.value(source, kAXChildrenAttribute) as? [AXUIElement] ?? []
                     for child in children {
@@ -272,11 +282,21 @@ final class WindowCatalog {
                         title: windowTitle(title, application: app, size: size),
                         minimized: AXRead.bool(window, kAXMinimizedAttribute) == true, size: size
                     )
+                    if !reportedKeys.contains(key),
+                       !policy.retainsUnreportedWindow(isPrimary: item.isPrimaryWindow, isMinimized: item.minimized,
+                           isApplicationHidden: app.isHidden,
+                           isOnscreen: cgWindows.contains { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == item.windowID },
+                           hasReliableWindowList: readResult == .success) { continue }
                     items.append(item)
                     cached[key] = item
                 }
                 for item in cached.values where item.pid == app.processIdentifier && !seen.contains(item.key) {
                     guard let element = item.element,
+                          policy.retainsUnreportedWindow(isPrimary: item.isPrimaryWindow,
+                              isMinimized: AXRead.bool(element, kAXMinimizedAttribute) == true,
+                              isApplicationHidden: app.isHidden,
+                              isOnscreen: cgWindows.contains { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == item.windowID },
+                              hasReliableWindowList: readResult == .success),
                           item.windowID == AXRead.windowID(element),
                           item.windowID.map(liveWindowIDs.contains) == true || AXRead.bool(element, kAXMinimizedAttribute) == true || app.isHidden else { continue }
                     items.append(item)
@@ -640,11 +660,49 @@ final class WindowCatalog {
                             onFronted: onFronted, completion: completion)
     }
 
+    /// A retained CG ID alone does not prove that a closed primary window can be raised.
+    private func resolveUnavailablePrimaryWindow(_ item: WindowItem, request: WindowFocusRequest,
+                                               onFronted: @escaping () -> Void, completion: @escaping (String?) -> Void) {
+        focusQueue.async { [self] in
+            guard !request.isCancelled else { return }
+            let source = AXUIElementCreateApplication(item.pid)
+            AXUIElementSetMessagingTimeout(source, 0.15)
+            var raw: CFTypeRef?
+            let result = AXUIElementCopyAttributeValue(source, kAXWindowsAttribute as CFString, &raw)
+            var windows = raw as? [AXUIElement] ?? []
+            for attribute in [kAXMainWindowAttribute, kAXFocusedWindowAttribute] {
+                if let window = AXRead.element(source, attribute) { windows.append(window) }
+            }
+            let stillReported = windows.contains { AXRead.windowID($0) == item.windowID }
+            let isMinimized = item.element.flatMap { AXRead.bool($0, kAXMinimizedAttribute) } == true
+            // Failed AX reads are inconclusive. Other Spaces still report their
+            // live windows through AX and continue through normal activation.
+            let shouldReopen = result == .success && !stillReported && !isMinimized && !item.application.isHidden
+            guard !request.isCancelled else { return }
+            if shouldReopen {
+                DispatchQueue.main.async { [self] in
+                    guard !request.isCancelled else { return }
+                    request.markReopen()
+                    reopenPrimaryWindow(item.applicationReopenEntry, request: request,
+                                        onFronted: onFronted, completion: completion)
+                }
+            } else {
+                focusWindowByID(item, request: request, onFronted: onFronted, completion: completion)
+            }
+        }
+    }
+
     private func focusExistingWindow(_ item: WindowItem, selectedElement: AXUIElement,
                                      request: WindowFocusRequest, onFronted: @escaping () -> Void,
                                      completion: @escaping (String?) -> Void) {
         if item.policy.focusMethod == .windowID {
-            focusWindowByID(item, request: request, onFronted: onFronted, completion: completion)
+            if item.isPrimaryWindow, !item.minimized, !item.application.isHidden, let id = item.windowID,
+               let rows = CGWindowListCopyWindowInfo(.optionIncludingWindow, id) as? [[String: Any]],
+               !rows.contains(where: { ($0[kCGWindowIsOnscreen as String] as? Bool) == true }) {
+                resolveUnavailablePrimaryWindow(item, request: request, onFronted: onFronted, completion: completion)
+            } else {
+                focusWindowByID(item, request: request, onFronted: onFronted, completion: completion)
+            }
             return
         }
         request.mark("legacy_queued")

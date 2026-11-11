@@ -40,6 +40,28 @@ struct SwitchShortcut {
     }
 }
 
+/// A close handoff waits for the entire chord to finish and its release to settle.
+struct CloseShortcutReleaseState {
+    private(set) var isWDown = false
+    private(set) var isCommandDown = false
+    private(set) var releasedAt: TimeInterval?
+
+    mutating func update(type: CGEventType, code: Int64, flags: CGEventFlags, at time: TimeInterval) {
+        isCommandDown = flags.contains(.maskCommand)
+        if code == 13 {
+            if type == .keyDown { isWDown = true }
+            if type == .keyUp { isWDown = false }
+        }
+        if isWDown || isCommandDown { releasedAt = nil }
+        else if releasedAt == nil { releasedAt = time }
+    }
+
+    func permitsHandoff(at time: TimeInterval) -> Bool {
+        guard !isWDown, !isCommandDown, let releasedAt else { return false }
+        return time - releasedAt >= 0.12
+    }
+}
+
 final class KeyboardTap {
     enum Action { case next(Bool), commit, cancel, openSearch, search(NSEvent) }
     var onAction: ((Action) -> Void)?
@@ -55,7 +77,12 @@ final class KeyboardTap {
     private var searchPinned = false
     var panelPresented = false
     private var swallowFindKeyUp = false
-    private(set) var isCloseKeyHeld = false
+    private var closeRelease = CloseShortcutReleaseState()
+    var isCloseKeyHeld: Bool { closeRelease.isWDown }
+    var canReturnAfterClose: Bool {
+        closeRelease.permitsHandoff(at: ProcessInfo.processInfo.systemUptime)
+    }
+    private(set) var closeShortcutEvents: [[String: Any]] = []
 
     func start() -> Bool {
         if let tap { return CGEvent.tapIsEnabled(tap: tap) }
@@ -81,7 +108,7 @@ final class KeyboardTap {
         if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
         tap = nil
         source = nil
-        isCloseKeyHeld = false
+        closeRelease = CloseShortcutReleaseState()
         switching = false
         enteringText = false
         searchPinned = false
@@ -96,7 +123,18 @@ final class KeyboardTap {
             return Unmanaged.passUnretained(event)
         }
         let code = event.getIntegerValueField(.keyboardEventKeycode)
-        if type == .keyUp, code == 13 { isCloseKeyHeld = false }
+        let now = ProcessInfo.processInfo.systemUptime
+        let commandChanged = closeRelease.isCommandDown != event.flags.contains(.maskCommand)
+        closeRelease.update(type: type, code: code, flags: event.flags, at: now)
+        if (code == 13 && (type == .keyDown || type == .keyUp)) || commandChanged {
+            closeShortcutEvents.append([
+                "uptime": now, "type": type.rawValue, "keyCode": code,
+                "command": event.flags.contains(.maskCommand),
+                "repeat": event.getIntegerValueField(.keyboardEventAutorepeat),
+                "foregroundPID": code == 13 ? (NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0) : 0
+            ])
+            closeShortcutEvents = Array(closeShortcutEvents.suffix(16))
+        }
         if type == .keyDown, let onRecord {
             onRecord(code, event.flags, NSEvent(cgEvent: event)?.charactersIgnoringModifiers)
             return nil
@@ -158,7 +196,6 @@ final class KeyboardTap {
         if !panelPresented, !switching, !enteringText, type == .keyDown, code == 13,
            flags == .maskCommand, event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
             // Observe Cmd+W without consuming or rewriting the application's event.
-            isCloseKeyHeld = true
             onCloseShortcut?()
         }
         return Unmanaged.passUnretained(event)

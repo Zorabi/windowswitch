@@ -26,6 +26,20 @@ final class WindowRecencyTests: XCTestCase {
         XCTAssertGreaterThan(reopened, .distantPast)
     }
 
+    func testCloseObservationRefreshesReopenRankWithoutFocusNotification() {
+        var history = WindowRecency()
+        let oldUse = Date(timeIntervalSince1970: 100)
+        let browserUse = oldUse.addingTimeInterval(10)
+        let closeUse = oldUse.addingTimeInterval(20)
+        history.recordWindow(key: "wechat-main", pid: 1, isPrimary: true, at: oldUse)
+        history.recordWindow(key: "browser", pid: 2, isPrimary: false, at: browserUse)
+        history.recordWindow(key: "wechat-main", pid: 1, isPrimary: true, at: closeUse)
+        history.retain(windowKeys: ["app:1", "browser"], pids: [1, 2])
+        let reopened = history.date(key: "app:1", pid: 1, isApplication: true, prefersPrimary: true)
+        XCTAssertEqual(reopened, closeUse)
+        XCTAssertGreaterThan(reopened, history.date(key: "browser", pid: 2, isApplication: false, prefersPrimary: false))
+    }
+
     func testMiniProgramDoesNotOverwriteMainWindowRecency() {
         var history = WindowRecency()
         let mainDate = Date(timeIntervalSince1970: 100)

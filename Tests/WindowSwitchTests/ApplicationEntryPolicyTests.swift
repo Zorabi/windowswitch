@@ -15,6 +15,24 @@ final class ApplicationEntryPolicyTests: XCTestCase {
         }
     }
 
+    func testUnreportedClosedWeChatPrimaryDoesNotSuppressReopenEntry() {
+        let policy = ApplicationWindowPolicy.forApplication(bundleID: "com.tencent.xinWeChat")
+        XCTAssertFalse(policy.retainsUnreportedWindow(isPrimary: true, isMinimized: false,
+            isApplicationHidden: false, isOnscreen: false, hasReliableWindowList: true))
+        XCTAssertTrue(policy.shouldIncludeApplicationEntry(isRegular: true, windowTitles: ["图片和视频"]))
+    }
+
+    func testUnreportedWindowsAreRetainedWhenClosureIsUncertain() {
+        let policy = ApplicationWindowPolicy.forApplication(bundleID: "com.tencent.xinWeChat")
+        for state in [(true, false, false, true), (false, true, false, true),
+                      (false, false, true, true), (false, false, false, false)] {
+            XCTAssertTrue(policy.retainsUnreportedWindow(isPrimary: true, isMinimized: state.0,
+                isApplicationHidden: state.1, isOnscreen: state.2, hasReliableWindowList: state.3))
+        }
+        XCTAssertTrue(policy.retainsUnreportedWindow(isPrimary: false, isMinimized: false,
+            isApplicationHidden: false, isOnscreen: false, hasReliableWindowList: true))
+    }
+
     func testWindowlessProxyDoesNotDuplicateHostedMiniProgram() {
         XCTAssertFalse(ApplicationEntryPolicy.shouldInclude(bundleID: "com.tencent.flue.WeApp", isRegular: true, windowTitles: []))
         XCTAssertFalse(ApplicationEntryPolicy.shouldInclude(bundleID: "com.tencent.flue.WeChatAppEx", isRegular: false, windowTitles: []))

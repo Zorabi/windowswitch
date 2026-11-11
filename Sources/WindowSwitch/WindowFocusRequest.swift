@@ -8,7 +8,7 @@ final class WindowFocusRequest {
     private var windowID: UInt32?
     let startedAt: TimeInterval
     private let origin: WindowFocusOrigin
-    private let isReopen: Bool
+    private var isReopen: Bool
     private let lock = NSLock()
     private var cancelled = false
     private var finished = false
@@ -49,6 +49,15 @@ final class WindowFocusRequest {
 
     var age: TimeInterval { ProcessInfo.processInfo.systemUptime - startedAt }
 
+    func markReopen() {
+        lock.lock()
+        guard !finished, !cancelled else { lock.unlock(); return }
+        isReopen = true
+        windowID = nil
+        lock.unlock()
+        mark("closed_primary_reopen")
+    }
+
     func updateTarget(_ id: UInt32?) {
         lock.lock()
         windowID = id
@@ -77,6 +86,7 @@ final class WindowFocusRequest {
         guard !finished else { lock.unlock(); return }
         finished = true
         let resolvedOutcome = cancelled ? "cancelled" : outcome
+        let isReopen = self.isReopen
         let milliseconds = age * 1000
         let snapshot: [String: Any] = [
             "recordedAt": ISO8601DateFormatter().string(from: Date()),

@@ -341,14 +341,14 @@ final class SwitcherPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         footer.stringValue = "直接键入搜索    Tab / ↑ ↓ 选择    ↩ 切换    Esc 取消"
     }
 
-    /// Visually leave immediately, releasing key ownership once the target fronts.
+    /// Remove the panel immediately; defer presentation cleanup until the target fronts.
     /// The bounded lease also covers unavailable, cancelled, or slow targets.
     func beginFocusHandoff(onRelease: ((String) -> Void)? = nil) -> () -> Void {
         guard panel.isVisible else { return {} }
         closing = true
         spinner.stopAnimation(nil)
-        panel.alphaValue = 0
         panel.ignoresMouseEvents = true
+        panel.orderOut(nil)
         if let localMonitor { NSEvent.removeMonitor(localMonitor) }
         localMonitor = nil
         let id = presentationID

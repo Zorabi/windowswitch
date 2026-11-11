@@ -45,6 +45,29 @@ final class KeyboardTapTests: XCTestCase {
         XCTAssertEqual(closes, 1)
     }
 
+    func testCloseHandoffWaitsForCommandReleaseAndSettling() {
+        var state = CloseShortcutReleaseState()
+        XCTAssertFalse(state.permitsHandoff(at: 100))
+        state.update(type: .keyDown, code: 13, flags: .maskCommand, at: 1)
+        state.update(type: .keyUp, code: 13, flags: .maskCommand, at: 1.02)
+        XCTAssertFalse(state.permitsHandoff(at: 2))
+        state.update(type: .flagsChanged, code: 55, flags: [], at: 2)
+        XCTAssertFalse(state.permitsHandoff(at: 2.1))
+        XCTAssertTrue(state.permitsHandoff(at: 2.13))
+        state.update(type: .flagsChanged, code: 55, flags: .maskCommand, at: 2.14)
+        XCTAssertFalse(state.permitsHandoff(at: 3))
+    }
+
+    func testCloseHandoffAlsoWaitsWhenCommandIsReleasedBeforeW() {
+        var state = CloseShortcutReleaseState()
+        state.update(type: .keyDown, code: 13, flags: .maskCommand, at: 1)
+        state.update(type: .flagsChanged, code: 55, flags: [], at: 1.01)
+        XCTAssertFalse(state.permitsHandoff(at: 2))
+        state.update(type: .keyUp, code: 13, flags: [], at: 2)
+        XCTAssertFalse(state.permitsHandoff(at: 2.1))
+        XCTAssertTrue(state.permitsHandoff(at: 2.13))
+    }
+
     func testStoppingClearsHeldCloseKey() {
         let tap = KeyboardTap()
         tap.shortcut = .standard

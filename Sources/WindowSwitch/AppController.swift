@@ -36,9 +36,9 @@ final class AppController: NSObject {
         let windowID: CGWindowID
         let startedAt = ProcessInfo.processInfo.systemUptime
         var targetPID: pid_t?
-        var deferredActions: [KeyboardTap.Action] = []
     }
     private var closeWindowHandoff: CloseWindowHandoff?
+    private let closeDiagnosticQueue = DispatchQueue(label: "dongx.windowswitch.close-diagnostics", qos: .utility)
 
     func start() {
         PreferencesWindow.applyAppearance()
@@ -123,22 +123,7 @@ final class AppController: NSObject {
 
     private func handle(_ action: KeyboardTap.Action) {
         guard trusted, !paused, recorder == nil else { return }
-        if case .next = action, let handoff = closeWindowHandoff, handoff.targetPID == nil {
-            returnFocusAfterClose(handoff.id)
-        }
-        if closeWindowHandoff?.targetPID != nil {
-            switch action {
-            case .next:
-                closeWindowHandoff?.deferredActions.append(action)
-                return
-            case .commit, .search:
-                if closeWindowHandoff?.deferredActions.isEmpty == false {
-                    closeWindowHandoff?.deferredActions.append(action)
-                    return
-                }
-            default: break
-            }
-        }
+        // Explicit switching takes priority over a pending automatic return.
         cancelCloseWindowHandoff()
         switch action {
         case .next(let reverse):
@@ -162,10 +147,20 @@ final class AppController: NSObject {
             let index = initialSelectionIndex(in: immediate, steps: pendingSteps)
             switcher.show(immediate, index: index, searching: false, shortcut: keyboard.shortcut.label,
                           commitOnRelease: keyboard.commitOnRelease, loading: loading)
+            if !loading, keyboard.commitOnRelease {
+                // A warm, held-key session needs no scan callback on the input queue.
+                // Refresh the next session's cache without rebuilding this list.
+                refreshWindowSnapshot(force: Date().timeIntervalSince(lastScan) >= 0.5)
+                return
+            }
             refreshWindowSnapshot(force: true) { [weak self] items in
                 guard let self, self.session == id else { return }
                 if !self.loading {
-                    self.switcher.updateItems(self.immediateWindowItems())
+                    // Keep the held-key session stable. Rebuilding its table can
+                    // delay a queued modifier release; the next session uses the new cache.
+                    if self.searchPinned || !self.keyboard.commitOnRelease {
+                        self.switcher.updateItems(items)
+                    }
                     return
                 }
                 self.loading = false
@@ -216,12 +211,19 @@ final class AppController: NSObject {
               let app = NSWorkspace.shared.frontmostApplication,
               app.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
         if let bundleID = app.bundleIdentifier, ApplicationFilters.shared.mode(for: bundleID) == .hidden { return }
+        cancelCloseWindowHandoff()
         let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         let windows = rows.filter {
             ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == app.processIdentifier
         }
         guard let windowID = visibleWindowIDs(in: windows).first else { return }
-        cancelCloseWindowHandoff()
+        // The AX focused-window notification may be absent or arrive after the
+        // window disappears. Preserve its use before forwarding the close key.
+        if let item = cachedItems.first(where: { $0.pid == app.processIdentifier && $0.windowID == windowID }) {
+            let usedAt = Date()
+            recordDisplayUse(item, at: usedAt)
+            catalog.noteWindowUse(item, at: usedAt)
+        }
         let handoff = CloseWindowHandoff(source: app, windowID: windowID)
         closeWindowHandoff = handoff
         // Give the original key event time to reach the application. Poll only
@@ -249,9 +251,9 @@ final class AppController: NSObject {
         let remainingIDs = visibleWindowIDs(in: remaining)
         let originalStillVisible = remainingIDs.contains(handoff.windowID)
         let hasOtherVisibleWindow = remainingIDs.contains { $0 != handoff.windowID }
-        // Do not move held Cmd+W repeats into the next application. The bounded
-        // handoff expires normally if the user keeps holding W.
-        if keyboard.isCloseKeyHeld || originalStillVisible || hasOtherVisibleWindow {
+        // A W key-up is observed before the application necessarily finishes
+        // handling its shortcut. Wait for Command release and a quiet interval too.
+        if !keyboard.canReturnAfterClose || originalStillVisible || hasOtherVisibleWindow {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
                 self?.returnFocusAfterClose(id)
             }
@@ -261,7 +263,7 @@ final class AppController: NSObject {
         let items = immediateWindowItems(applyFilters: false)
         cachedItems = items
         guard let target = items.first(where: {
-            $0.pid != handoff.source.processIdentifier && $0.canRepresentForegroundWindow &&
+            $0.pid != handoff.source.processIdentifier && !$0.isLocalSettings && $0.canRepresentForegroundWindow &&
             !$0.minimized && !$0.application.isHidden &&
             $0.windowID.map(visibleIDs.contains) == true && ApplicationFilters.shared.allows($0)
         }) else {
@@ -269,27 +271,35 @@ final class AppController: NSObject {
             return
         }
         closeWindowHandoff?.targetPID = target.pid
+        recordCloseHandoff(handoff, target: target, phase: "activation_requested")
         let finish = { [weak self] in
             guard self?.closeWindowHandoff?.id == id else { return }
-            self?.resumeSwitchingAfterClose(id)
-            guard self?.closeWindowHandoff?.id == id else { return }
+            self?.recordCloseHandoff(handoff, target: target, phase: "completed")
             self?.closeWindowHandoff = nil
         }
-        if target.isLocalSettings, let preferences {
-            let startedAt = ProcessInfo.processInfo.systemUptime
-            preferences.present()
-            DispatchQueue.main.async { [weak self, weak preferences] in
-                guard self?.closeWindowHandoff?.id == id else { return }
-                let confirmed = preferences?.window?.isKeyWindow == true && NSApp.isActive
-                SwitchStatistics.shared.record(origin: .automaticReturn, isReopen: false,
-                    outcome: confirmed ? "confirmed" : "local_settings_unconfirmed",
-                    milliseconds: (ProcessInfo.processInfo.systemUptime - startedAt) * 1000)
-                finish()
-            }
-        } else {
-            catalog.focus(target, origin: .automaticReturn, onFronted: { [weak self] in
-                self?.resumeSwitchingAfterClose(id)
-            }) { _ in finish() }
+        // Settings are available through explicit selection only; a close in
+        // another application must not present our preferences as a side effect.
+        catalog.focus(target, origin: .automaticReturn) { _ in finish() }
+    }
+
+    private func recordCloseHandoff(_ handoff: CloseWindowHandoff, target: WindowItem, phase: String) {
+        let snapshot: [String: Any] = [
+            "recordedAt": ISO8601DateFormatter().string(from: Date()),
+            "phase": phase, "uptime": ProcessInfo.processInfo.systemUptime,
+            "startedAt": handoff.startedAt, "sourcePID": handoff.source.processIdentifier,
+            "sourceBundleID": handoff.source.bundleIdentifier ?? "",
+            "sourceWindowID": handoff.windowID, "targetPID": target.pid,
+            "targetBundleID": target.application.bundleIdentifier ?? "",
+            "targetWindowID": target.windowID ?? 0, "keyEvents": keyboard.closeShortcutEvents
+        ]
+        closeDiagnosticQueue.async {
+            guard let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+                .first?.appendingPathComponent("dongx.windowswitch") else { return }
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let data = try JSONSerialization.data(withJSONObject: snapshot, options: [.prettyPrinted, .sortedKeys])
+                try data.write(to: directory.appendingPathComponent("last-close-handoff.json"), options: .atomic)
+            } catch { /* Diagnostics must not affect window focus. */ }
         }
     }
 
@@ -302,13 +312,6 @@ final class AppController: NSObject {
                   rect.width >= 70, rect.height >= 70 else { return nil }
             return (row[kCGWindowNumber as String] as? NSNumber)?.uint32Value
         }
-    }
-
-    private func resumeSwitchingAfterClose(_ id: UUID) {
-        guard let handoff = closeWindowHandoff, handoff.id == id,
-              !handoff.deferredActions.isEmpty else { return }
-        closeWindowHandoff = nil
-        handoff.deferredActions.forEach { handle($0) }
     }
 
     private func localSettingsItems() -> [WindowItem] {
@@ -407,10 +410,14 @@ final class AppController: NSObject {
             self.scanInFlight = false
             let waiters = self.scanWaiters
             self.scanWaiters.removeAll()
-            let current = self.immediateWindowItems(applyFilters: false)
-            self.cachedItems = current
-            let visible = current.filter { ApplicationFilters.shared.allows($0) }
-            waiters.forEach { $0(visible) }
+            // Reconcile only when a caller is waiting to show results. Background
+            // publication should not block input on another WindowServer round trip.
+            if !waiters.isEmpty {
+                let current = self.immediateWindowItems(applyFilters: false)
+                self.cachedItems = current
+                let visible = current.filter { ApplicationFilters.shared.allows($0) }
+                waiters.forEach { $0(visible) }
+            }
         }
     }
 
