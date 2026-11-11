@@ -34,10 +34,12 @@ final class AppController: NSObject {
         let id = UUID()
         let source: NSRunningApplication
         let windowID: CGWindowID
+        let previousPID: pid_t?
         let startedAt = ProcessInfo.processInfo.systemUptime
         var targetPID: pid_t?
     }
     private var closeWindowHandoff: CloseWindowHandoff?
+    private var activationHistory = ApplicationActivationHistory()
     private let closeDiagnosticQueue = DispatchQueue(label: "dongx.windowswitch.close-diagnostics", qos: .utility)
 
     func start() {
@@ -78,6 +80,10 @@ final class AppController: NSObject {
                let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier,
                pid != handoff.source.processIdentifier, pid != handoff.targetPID {
                 self.cancelCloseWindowHandoff()
+            }
+            if let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+               pid != NSRunningApplication.current.processIdentifier || self.preferences?.window?.isKeyWindow == true {
+                self.activationHistory.record(pid: pid)
             }
             self.recordForegroundWindowUse()
             self.catalog.noteFocusedWindow()
@@ -224,7 +230,8 @@ final class AppController: NSObject {
             recordDisplayUse(item, at: usedAt)
             catalog.noteWindowUse(item, at: usedAt)
         }
-        let handoff = CloseWindowHandoff(source: app, windowID: windowID)
+        let previousPID = activationHistory.currentPID == app.processIdentifier ? activationHistory.previousPID : nil
+        let handoff = CloseWindowHandoff(source: app, windowID: windowID, previousPID: previousPID)
         closeWindowHandoff = handoff
         // Give the original key event time to reach the application. Poll only
         // this bounded close request; the normal catalog scan interval is unchanged.
@@ -262,12 +269,29 @@ final class AppController: NSObject {
         let visibleIDs = Set(visibleWindowIDs(in: rows))
         let items = immediateWindowItems(applyFilters: false)
         cachedItems = items
-        guard let target = items.first(where: {
-            $0.pid != handoff.source.processIdentifier && !$0.isLocalSettings && $0.canRepresentForegroundWindow &&
+        let candidates = items.filter {
+            $0.pid != handoff.source.processIdentifier && $0.canRepresentForegroundWindow &&
             !$0.minimized && !$0.application.isHidden &&
             $0.windowID.map(visibleIDs.contains) == true && ApplicationFilters.shared.allows($0)
-        }) else {
+        }
+        guard let targetPID = AutomaticReturnPolicy.targetPID(previousPID: handoff.previousPID,
+            eligiblePIDs: candidates.map(\.pid), excludedFallbackPID: NSRunningApplication.current.processIdentifier),
+              let target = candidates.first(where: { $0.pid == targetPID && $0.key == observedFocus[targetPID]?.key }) ??
+                candidates.first(where: { $0.pid == targetPID }) else {
             cancelCloseWindowHandoff()
+            return
+        }
+        if target.isLocalSettings, let preferences {
+            recordCloseHandoff(handoff, target: target, phase: "return_to_previous_application")
+            closeWindowHandoff = nil
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            preferences.present()
+            DispatchQueue.main.async { [weak preferences] in
+                let confirmed = preferences?.window?.isKeyWindow == true && NSApp.isActive
+                SwitchStatistics.shared.record(origin: .automaticReturn, isReopen: false,
+                    outcome: confirmed ? "confirmed" : "local_settings_unconfirmed",
+                    milliseconds: (ProcessInfo.processInfo.systemUptime - startedAt) * 1000)
+            }
             return
         }
         closeWindowHandoff?.targetPID = target.pid
@@ -277,8 +301,6 @@ final class AppController: NSObject {
             self?.recordCloseHandoff(handoff, target: target, phase: "completed")
             self?.closeWindowHandoff = nil
         }
-        // Settings are available through explicit selection only; a close in
-        // another application must not present our preferences as a side effect.
         catalog.focus(target, origin: .automaticReturn) { _ in finish() }
     }
 
@@ -286,7 +308,8 @@ final class AppController: NSObject {
         let snapshot: [String: Any] = [
             "recordedAt": ISO8601DateFormatter().string(from: Date()),
             "phase": phase, "uptime": ProcessInfo.processInfo.systemUptime,
-            "startedAt": handoff.startedAt, "sourcePID": handoff.source.processIdentifier,
+            "startedAt": handoff.startedAt, "previousPID": handoff.previousPID ?? 0,
+            "sourcePID": handoff.source.processIdentifier,
             "sourceBundleID": handoff.source.bundleIdentifier ?? "",
             "sourceWindowID": handoff.windowID, "targetPID": target.pid,
             "targetBundleID": target.application.bundleIdentifier ?? "",
@@ -567,6 +590,9 @@ final class AppController: NSObject {
             settings.onClearSearchShortcut = { [weak self] in self?.clearShortcut(search: true) }
             settings.onFocused = { [weak self] in
                 guard let self else { return }
+                if NSWorkspace.shared.frontmostApplication?.processIdentifier == NSRunningApplication.current.processIdentifier {
+                    self.activationHistory.record(pid: NSRunningApplication.current.processIdentifier)
+                }
                 self.catalog.noteLocalWindowUse(key: "local:settings", pid: NSRunningApplication.current.processIdentifier)
                 if let item = self.localSettingsItems().first { self.recordDisplayUse(item, at: Date()) }
             }

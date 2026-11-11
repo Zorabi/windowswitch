@@ -34,3 +34,23 @@ struct WindowRecency {
         primaryWindows = primaryWindows.filter { pids.contains($0.key) }
     }
 }
+
+/// Repeated activation notifications must not erase the actual previous application.
+struct ApplicationActivationHistory {
+    private(set) var currentPID: pid_t?
+    private(set) var previousPID: pid_t?
+
+    mutating func record(pid: pid_t) {
+        guard currentPID != pid else { return }
+        previousPID = currentPID
+        currentPID = pid
+    }
+}
+
+/// Prefer the actual previous application, then fall back to eligible MRU windows.
+enum AutomaticReturnPolicy {
+    static func targetPID(previousPID: pid_t?, eligiblePIDs: [pid_t], excludedFallbackPID: pid_t) -> pid_t? {
+        if let previousPID, eligiblePIDs.contains(previousPID) { return previousPID }
+        return eligiblePIDs.first { $0 != excludedFallbackPID }
+    }
+}

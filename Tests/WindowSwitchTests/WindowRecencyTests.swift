@@ -4,6 +4,31 @@ import XCTest
 @testable import WindowSwitch
 
 final class WindowRecencyTests: XCTestCase {
+    func testAutomaticReturnPrefersPreviousApplicationOverMRU() {
+        XCTAssertEqual(AutomaticReturnPolicy.targetPID(previousPID: 2, eligiblePIDs: [3, 1, 2], excludedFallbackPID: 1), 2)
+        XCTAssertEqual(AutomaticReturnPolicy.targetPID(previousPID: 1, eligiblePIDs: [3, 1, 2], excludedFallbackPID: 1), 1)
+    }
+
+    func testUnavailablePreviousApplicationFallsBackWithoutOpeningSettings() {
+        XCTAssertEqual(AutomaticReturnPolicy.targetPID(previousPID: 4, eligiblePIDs: [1, 3, 2], excludedFallbackPID: 1), 3)
+        XCTAssertEqual(AutomaticReturnPolicy.targetPID(previousPID: nil, eligiblePIDs: [1, 2], excludedFallbackPID: 1), 2)
+        XCTAssertNil(AutomaticReturnPolicy.targetPID(previousPID: 4, eligiblePIDs: [1], excludedFallbackPID: 1))
+        XCTAssertNil(AutomaticReturnPolicy.targetPID(previousPID: 2, eligiblePIDs: [], excludedFallbackPID: 1))
+    }
+
+    func testSettingsArePreviousOnlyWhenActivatedImmediatelyBeforeSource() {
+        var history = ApplicationActivationHistory()
+        history.record(pid: 1) // settings
+        history.record(pid: 2) // WeChat
+        history.record(pid: 2) // duplicate notification
+        XCTAssertEqual(history.previousPID, 1)
+        XCTAssertEqual(history.currentPID, 2)
+        history.record(pid: 3) // another application
+        history.record(pid: 2)
+        XCTAssertEqual(history.previousPID, 3)
+        XCTAssertEqual(history.currentPID, 2)
+    }
+
     func testCatalogObservationSurvivesMissingOrOlderDisplayHistory() {
         var history = WindowRecency()
         let recent = Date(timeIntervalSince1970: 200)
