@@ -18,6 +18,16 @@ struct WindowItem {
     var isLocalSettingsReopen = false
     var lastUsedAt = Date.distantPast
 
+    var isRunning: Bool {
+        guard pid > 0, application.processIdentifier == pid, !application.isTerminated else { return false }
+        if pid == ProcessInfo.processInfo.processIdentifier { return true }
+        guard let current = NSRunningApplication(processIdentifier: pid), !current.isTerminated else { return false }
+        if let previousLaunch = application.launchDate, let currentLaunch = current.launchDate {
+            return previousLaunch == currentLaunch
+        }
+        return application.bundleIdentifier == current.bundleIdentifier
+    }
+
     var isLocalSettings: Bool { key == "local:settings" }
     var policy: ApplicationWindowPolicy {
         ApplicationWindowPolicy.forApplication(bundleID: application.bundleIdentifier)
@@ -622,6 +632,12 @@ final class WindowCatalog {
                origin: WindowFocusOrigin = .switcher,
                onFronted: @escaping () -> Void = {}, completion: @escaping (String?) -> Void) {
         cancelPendingFocus()
+        // A reopen action restores a window of a running application. It must
+        // never launch an application that exited after this list was captured.
+        guard item.isRunning else {
+            completion("目标应用已经退出，请重新选择。")
+            return
+        }
         let request = WindowFocusRequest(pid: item.pid, windowID: item.windowID, startedAt: requestedAt,
             diagnosticFile: item.policy.focusDiagnosticFile, origin: origin, isReopen: item.isApplicationEntry)
         activeFocusRequest = request

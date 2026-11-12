@@ -13,6 +13,7 @@ final class AppController: NSObject {
     private var recorder: Any?
     private var timer: Timer?
     private var activationObserver: NSObjectProtocol?
+    private var terminationObserver: NSObjectProtocol?
     private var session: UUID?
     private var sessionSourcePID: pid_t?
     private var loading = false
@@ -96,6 +97,22 @@ final class AppController: NSObject {
             }
             if !self.switcher.panel.isVisible { self.preferences?.restoreAfterSwitcher() }
         }
+        terminationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let self,
+                  let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            let pid = app.processIdentifier
+            guard self.cachedItems.contains(where: { $0.pid == pid }) || self.observedFocus[pid] != nil else { return }
+            self.cachedItems.removeAll { $0.pid == pid }
+            self.observedFocus.removeValue(forKey: pid)
+            if self.closeWindowHandoff?.source.processIdentifier == pid || self.closeWindowHandoff?.targetPID == pid {
+                self.cancelCloseWindowHandoff()
+            }
+            // Even a held-key session must drop an exited application immediately.
+            if self.switcher.panel.isVisible { self.switcher.updateItems(self.immediateWindowItems()) }
+            self.refreshWindowSnapshot(force: true)
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.checkPermission() }
         checkPermission()
         updateMenu()
@@ -109,6 +126,7 @@ final class AppController: NSObject {
         keyboard.stop()
         timer?.invalidate()
         if let activationObserver { NSWorkspace.shared.notificationCenter.removeObserver(activationObserver) }
+        if let terminationObserver { NSWorkspace.shared.notificationCenter.removeObserver(terminationObserver) }
         if let recorder { NSEvent.removeMonitor(recorder) }
     }
 
@@ -435,8 +453,9 @@ final class AppController: NSObject {
         scanInFlight = true
         catalog.load(additionalItems: localSettingsItems()) { [weak self] items in
             guard let self else { return }
-            self.cachedItems = items
             let livePIDs = Set(NSWorkspace.shared.runningApplications.map(\.processIdentifier))
+            let items = items.filter { livePIDs.contains($0.pid) && !$0.application.isTerminated }
+            self.cachedItems = items
             self.displayRecency.retain(windowKeys: Set(items.map(\.key)), pids: livePIDs)
             self.observedFocus = self.observedFocus.filter { livePIDs.contains($0.key) }
             self.lastScan = Date()
@@ -461,13 +480,14 @@ final class AppController: NSObject {
         let rows = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         let ids = Set(rows.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value })
         let settings = localSettingsItems().first
+        let livePIDs = Set(NSWorkspace.shared.runningApplications.map(\.processIdentifier))
         let live = cachedItems.filter {
-            !$0.application.isTerminated && !$0.isLocalSettings && ($0.windowID.map(ids.contains) ?? true)
+            livePIDs.contains($0.pid) && !$0.application.isTerminated && !$0.isLocalSettings && ($0.windowID.map(ids.contains) ?? true)
         }
         let liveWindows = Dictionary(grouping: live.filter { !$0.isApplicationEntry }, by: \.pid)
         var items: [WindowItem] = []
         var seen = Set<String>()
-        for old in cachedItems where !old.application.isTerminated {
+        for old in cachedItems where livePIDs.contains(old.pid) && !old.application.isTerminated {
             let item: WindowItem?
             if old.isLocalSettings { item = settings }
             else {
