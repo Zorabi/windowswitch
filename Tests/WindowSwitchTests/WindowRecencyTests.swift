@@ -4,6 +4,74 @@ import XCTest
 @testable import WindowSwitch
 
 final class WindowRecencyTests: XCTestCase {
+    func testSingleWindowKeepsRecentApplicationUseWhenWindowFocusIsMissing() {
+        var history = WindowRecency()
+        let oldUse = Date(timeIntervalSince1970: 100)
+        let closedAt = oldUse.addingTimeInterval(20)
+        history.recordWindow(key: "rednote-old", pid: 1, isPrimary: false, at: oldUse)
+        history.recordWindow(key: "browser", pid: 2, isPrimary: false, at: oldUse.addingTimeInterval(10))
+        history.recordApplication(pid: 1, at: closedAt)
+        history.retain(windowKeys: ["rednote-new", "browser"], pids: [1, 2])
+        let recent = history.date(key: "rednote-new", pid: 1, isApplication: false, prefersPrimary: false, isOnlyWindow: true)
+        XCTAssertEqual(recent, closedAt)
+        XCTAssertGreaterThan(recent, history.date(key: "browser", pid: 2, isApplication: false, prefersPrimary: false))
+    }
+
+    func testApplicationActivationDoesNotPromoteEveryWindowOrClosedPrimary() {
+        var history = WindowRecency()
+        let oldUse = Date(timeIntervalSince1970: 100)
+        history.recordWindow(key: "old", pid: 1, isPrimary: true, at: oldUse)
+        history.recordWindow(key: "new", pid: 1, isPrimary: false, at: oldUse.addingTimeInterval(10))
+        history.recordApplication(pid: 1, at: oldUse.addingTimeInterval(20))
+        XCTAssertEqual(history.date(key: "old", pid: 1, isApplication: false, prefersPrimary: false), oldUse)
+        XCTAssertEqual(history.date(key: "old", pid: 1, isApplication: false, prefersPrimary: true), oldUse)
+        XCTAssertEqual(history.date(key: "app:1", pid: 1, isApplication: true, prefersPrimary: true, isOnlyWindow: true), oldUse)
+    }
+
+    func testMixedSingleWindowApplicationsFollowActualActivationOrder() {
+        var history = WindowRecency()
+        let oldUse = Date(timeIntervalSince1970: 100)
+        history.recordWindow(key: "wechat", pid: 1, isPrimary: true, at: oldUse)
+        history.recordWindow(key: "rednote", pid: 2, isPrimary: false, at: oldUse)
+        history.recordWindow(key: "browser", pid: 3, isPrimary: false, at: oldUse)
+        // Focus notifications can be missed; all three live singleton windows
+        // must still agree with the actual application activation sequence.
+        history.recordApplication(pid: 2, at: oldUse.addingTimeInterval(10))
+        history.recordApplication(pid: 1, at: oldUse.addingTimeInterval(20))
+        history.recordApplication(pid: 3, at: oldUse.addingTimeInterval(30))
+        let windows: [(key: String, pid: pid_t, primary: Bool)] = [
+            ("wechat", 1, true), ("rednote", 2, false), ("browser", 3, false)
+        ]
+        let ordered = windows.sorted {
+            history.date(key: $0.key, pid: $0.pid, isApplication: false, prefersPrimary: $0.primary, isOnlyWindow: true) >
+            history.date(key: $1.key, pid: $1.pid, isApplication: false, prefersPrimary: $1.primary, isOnlyWindow: true)
+        }
+        XCTAssertEqual(ordered.map(\.key), ["browser", "wechat", "rednote"])
+    }
+
+    func testClosedPrimaryKeepsApplicationUseWhenCloseFocusNotificationIsMissing() {
+        var history = WindowRecency()
+        let firstUse = Date(timeIntervalSince1970: 100)
+        let closeUse = firstUse.addingTimeInterval(20)
+        history.recordWindow(key: "main", pid: 1, isPrimary: true, at: firstUse)
+        history.recordApplication(pid: 1, at: closeUse)
+        history.retain(windowKeys: ["app:1"], pids: [1])
+        XCTAssertEqual(history.date(key: "app:1", pid: 1, isApplication: true, prefersPrimary: true), closeUse)
+        // A late old notification must not change the most recently used window.
+        history.recordWindow(key: "chat", pid: 1, isPrimary: false, at: firstUse.addingTimeInterval(-1))
+        XCTAssertEqual(history.date(key: "app:1", pid: 1, isApplication: true, prefersPrimary: true), closeUse)
+    }
+
+    func testOtherWindowApplicationUseDoesNotPromoteClosedPrimary() {
+        var history = WindowRecency()
+        let firstUse = Date(timeIntervalSince1970: 100)
+        history.recordWindow(key: "main", pid: 1, isPrimary: true, at: firstUse)
+        history.recordWindow(key: "mini", pid: 1, isPrimary: false, at: firstUse.addingTimeInterval(10))
+        history.recordApplication(pid: 1, at: firstUse.addingTimeInterval(20))
+        history.retain(windowKeys: ["app:1", "mini"], pids: [1])
+        XCTAssertEqual(history.date(key: "app:1", pid: 1, isApplication: true, prefersPrimary: true), firstUse)
+    }
+
     func testAutomaticReturnPrefersPreviousApplicationOverMRU() {
         XCTAssertEqual(AutomaticReturnPolicy.targetPID(previousPID: 2, eligiblePIDs: [3, 1, 2], excludedFallbackPID: 1), 2)
         XCTAssertEqual(AutomaticReturnPolicy.targetPID(previousPID: 1, eligiblePIDs: [3, 1, 2], excludedFallbackPID: 1), 1)

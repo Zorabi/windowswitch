@@ -7,6 +7,7 @@ struct WindowRecency {
     private var windows: [String: Date] = [:]
     private var applications: [pid_t: Date] = [:]
     private var primaryWindows: [pid_t: Date] = [:]
+    private var lastWindows: [pid_t: (isPrimary: Bool, date: Date)] = [:]
 
     mutating func recordApplication(pid: pid_t, at date: Date) {
         applications[pid] = max(applications[pid] ?? .distantPast, date)
@@ -16,14 +17,25 @@ struct WindowRecency {
         windows[key] = max(windows[key] ?? .distantPast, date)
         recordApplication(pid: pid, at: date)
         if isPrimary { primaryWindows[pid] = max(primaryWindows[pid] ?? .distantPast, date) }
+        if date >= (lastWindows[pid]?.date ?? .distantPast) { lastWindows[pid] = (isPrimary, date) }
     }
 
-    func date(key: String, pid: pid_t, isApplication: Bool, prefersPrimary: Bool, observedAt: Date = .distantPast) -> Date {
-        max(observedAt, recordedDate(key: key, pid: pid, isApplication: isApplication, prefersPrimary: prefersPrimary))
+    func date(key: String, pid: pid_t, isApplication: Bool, prefersPrimary: Bool, observedAt: Date = .distantPast, isOnlyWindow: Bool = false) -> Date {
+        let windowDate = recordedDate(key: key, pid: pid, isApplication: isApplication, prefersPrimary: prefersPrimary)
+        let applicationDate = isOnlyWindow && !isApplication ? applications[pid] ?? .distantPast : .distantPast
+        return max(observedAt, windowDate, applicationDate)
     }
 
     private func recordedDate(key: String, pid: pid_t, isApplication: Bool, prefersPrimary: Bool) -> Date {
-        if prefersPrimary, let date = primaryWindows[pid] { return date }
+        if prefersPrimary, let date = primaryWindows[pid] {
+            // A main-window reopen entry keeps application use that could not
+            // be attached to its disappearing AX window. Other windows never
+            // transfer their use to that entry.
+            if isApplication, lastWindows[pid]?.isPrimary == true {
+                return max(date, applications[pid] ?? .distantPast)
+            }
+            return date
+        }
         if isApplication { return applications[pid] ?? .distantPast }
         return windows[key] ?? .distantPast
     }
@@ -32,6 +44,7 @@ struct WindowRecency {
         windows = windows.filter { windowKeys.contains($0.key) }
         applications = applications.filter { pids.contains($0.key) }
         primaryWindows = primaryWindows.filter { pids.contains($0.key) }
+        lastWindows = lastWindows.filter { pids.contains($0.key) }
     }
 }
 

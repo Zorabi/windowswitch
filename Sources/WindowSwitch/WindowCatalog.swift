@@ -342,10 +342,12 @@ final class WindowCatalog {
             }
             let liveKeys = Set(items.map(\.key))
             recency.retain(windowKeys: liveKeys, pids: livePIDs)
+            let windowCounts = Dictionary(grouping: items.filter { !$0.isApplicationEntry }, by: \.pid).mapValues(\.count)
             for index in items.indices {
                 let item = items[index]
                 items[index].lastUsedAt = recency.date(key: item.key, pid: item.pid,
-                    isApplication: item.isApplicationEntry, prefersPrimary: item.isPrimaryWindow)
+                    isApplication: item.isApplicationEntry, prefersPrimary: item.isPrimaryWindow,
+                    isOnlyWindow: !item.isApplicationEntry && windowCounts[item.pid] == 1)
             }
             items.sort { left, right in
                 let leftDate = left.lastUsedAt

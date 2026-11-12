@@ -85,6 +85,10 @@ final class AppController: NSObject {
                pid != NSRunningApplication.current.processIdentifier || self.preferences?.window?.isKeyWindow == true {
                 self.activationHistory.record(pid: pid)
             }
+            if let app = NSWorkspace.shared.frontmostApplication,
+               app.processIdentifier != NSRunningApplication.current.processIdentifier {
+                self.displayRecency.recordApplication(pid: app.processIdentifier, at: Date())
+            }
             self.recordForegroundWindowUse()
             self.catalog.noteFocusedWindow()
             if self.session == nil {
@@ -218,11 +222,17 @@ final class AppController: NSObject {
               app.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
         if let bundleID = app.bundleIdentifier, ApplicationFilters.shared.mode(for: bundleID) == .hidden { return }
         cancelCloseWindowHandoff()
+        displayRecency.recordApplication(pid: app.processIdentifier, at: Date())
         let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         let windows = rows.filter {
             ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == app.processIdentifier
         }
-        guard let windowID = visibleWindowIDs(in: windows).first else { return }
+        let sourceWindowIDs = visibleWindowIDs(in: windows)
+        // Floating/helper windows can precede the actual switchable window.
+        let knownWindowID = sourceWindowIDs.first { id in
+            cachedItems.contains { $0.pid == app.processIdentifier && $0.windowID == id && !$0.isApplicationEntry }
+        }
+        guard let windowID = knownWindowID ?? sourceWindowIDs.first else { return }
         // The AX focused-window notification may be absent or arrive after the
         // window disappears. Preserve its use before forwarding the close key.
         if let item = cachedItems.first(where: { $0.pid == app.processIdentifier && $0.windowID == windowID }) {
@@ -473,11 +483,14 @@ final class AppController: NSObject {
             if let item, seen.insert(item.key).inserted { items.append(item) }
         }
         if let settings, seen.insert(settings.key).inserted { items.append(settings) }
+        let windowCounts = Dictionary(grouping: items.filter { !$0.isApplicationEntry }, by: \.pid).mapValues(\.count)
         items = items.enumerated().sorted { left, right in
             let leftDate = displayRecency.date(key: left.element.key, pid: left.element.pid,
-                isApplication: left.element.isApplicationEntry, prefersPrimary: left.element.isPrimaryWindow, observedAt: left.element.lastUsedAt)
+                isApplication: left.element.isApplicationEntry, prefersPrimary: left.element.isPrimaryWindow, observedAt: left.element.lastUsedAt,
+                isOnlyWindow: !left.element.isApplicationEntry && windowCounts[left.element.pid] == 1)
             let rightDate = displayRecency.date(key: right.element.key, pid: right.element.pid,
-                isApplication: right.element.isApplicationEntry, prefersPrimary: right.element.isPrimaryWindow, observedAt: right.element.lastUsedAt)
+                isApplication: right.element.isApplicationEntry, prefersPrimary: right.element.isPrimaryWindow, observedAt: right.element.lastUsedAt,
+                isOnlyWindow: !right.element.isApplicationEntry && windowCounts[right.element.pid] == 1)
             return leftDate == rightDate ? left.offset < right.offset : leftDate > rightDate
         }.map(\.element)
         let foregroundPID = switcher.panel.isVisible ? sessionSourcePID : NSWorkspace.shared.frontmostApplication?.processIdentifier
